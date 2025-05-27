@@ -1,9 +1,24 @@
 #!/bin/bash
 
-# 安装编译工具
-echo "安装 gcc 和 libcap..."
+# 安装依赖工具
+echo "安装 gcc、libcap 和 curl..."
 apt update
-apt install -y gcc libcap2-bin
+apt install -y gcc libcap2-bin curl
+
+# 下载 zf.c
+ZF_URL="https://raw.githubusercontent.com/R1tain/zf/refs/heads/main/zf.c"
+echo "下载 zf.c 从 $ZF_URL..."
+curl -L -o zf.c "$ZF_URL"
+if [ $? -ne 0 ]; then
+    echo "下载 zf.c 失败，退出"
+    exit 1
+fi
+
+# 验证 zf.c 是否有效
+if [ ! -s zf.c ]; then
+    echo "下载的 zf.c 文件为空或无效，退出"
+    exit 1
+fi
 
 # 编译 C 程序
 echo "编译 zf..."
@@ -33,8 +48,11 @@ echo "设置 ICMP 权限..."
 setcap cap_net_raw+ep /usr/local/bin/zf
 
 # 配置 logrotate
-echo "配置 logrotate..."
-cat > /etc/logrotate.d/zf << 'EOF'
+if [ -f /etc/logrotate.d/zf ]; then
+    echo "logrotate 配置文件已存在，跳过生成：/etc/logrotate.d/zf"
+else
+    echo "配置 logrotate..."
+    cat > /etc/logrotate.d/zf << 'EOF'
 /var/log/zf.log {
     weekly
     rotate 4
@@ -42,7 +60,8 @@ cat > /etc/logrotate.d/zf << 'EOF'
     missingok
 }
 EOF
-chmod 644 /etc/logrotate.d/zf
+    chmod 644 /etc/logrotate.d/zf
+fi
 
 # 生成说明文档
 echo "生成 README.md..."
@@ -64,7 +83,7 @@ cat > README.md << 'EOF'
 
 - **编译位置**:
   - 当前文件夹（执行 `install.sh` 的目录）
-  - 源文件 `zf.c` 在此编译生成可执行文件 `zf`。
+  - 源文件 `zf.c` 从 https://raw.githubusercontent.com/R1tain/zf/refs/heads/main/zf.c 下载并在此编译生成可执行文件 `zf`.
 
 - **编译后文件位置**:
   - `/usr/local/bin/zf`
@@ -101,12 +120,13 @@ cat > README.md << 'EOF'
 
 - **日志管理**:
   - 日志轮转已自动配置（`/etc/logrotate.d/zf`），每周轮转，保留 4 个备份，压缩旧日志。
+  - 重复执行 `install.sh` 不会覆盖现有 `logrotate` 配置。
 
 - **IPv6**:
   - 若使用 `-v6` 或 `-both`，确保系统和网络支持 IPv6。
 
 - **环境**:
-  - 测试于 Ubuntu 22.04，确保 `gcc` 和 `libcap2-bin` 已安装。
+  - 测试于 Ubuntu 22.04，确保 `gcc`、`libcap2-bin` 和 `curl` 已安装。
   - 内核版本需高于 3.7（支持 `TCP_FASTOPEN`，若不支持自动禁用）。
 
 ## 编译和安装
