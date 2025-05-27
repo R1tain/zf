@@ -51,19 +51,7 @@
   - ICMP 监控需要 `CAP_NET_RAW` 权限（由 `setcap` 设置）。
 
 - **日志管理**:
-  - 建议配置 logrotate 清理 `/var/log/zf.log`：
-    ```bash
-    sudo nano /etc/logrotate.d/zf
-    ```
-    添加：
-    ```
-    /var/log/zf.log {
-        weekly
-        rotate 4
-        compress
-        missingok
-    }
-    ```
+  - 日志轮转已自动配置（`/etc/logrotate.d/zf`），每周轮转，保留 4 个备份，压缩旧日志。
 
 - **IPv6**:
   - 若使用 `-v6` 或 `-both`，确保系统和网络支持 IPv6。
