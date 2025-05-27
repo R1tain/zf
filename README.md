@@ -15,7 +15,7 @@
 
 - **编译位置**:
   - 当前文件夹（执行 `install.sh` 的目录）
-  - 源文件 `zf.c` 在此编译生成可执行文件 `zf`。
+  - 源文件 `zf.c` 从 https://raw.githubusercontent.com/R1tain/zf/refs/heads/main/zf.c 下载并在此编译生成可执行文件 `zf`.
 
 - **编译后文件位置**:
   - `/usr/local/bin/zf`
@@ -28,8 +28,10 @@
    zf v4 0.0.0.0:8080 example.com:80 -p tcp,udp -c 30 -t 30
    ```
    - 转发 IPv4 的 TCP 和 UDP 流量到 `example.com:80`。
-   - `-t 30` 表示 30 秒空闲后关闭连接，但主进程继续监听。
-   - `-c 30` 表示每 30 秒检查远程主机连通性。
+   - `-t 30`：30 秒空闲后关闭连接，主进程继续监听。
+   - `-c 30`：每 30 秒检查远程主机连通性。
+     - 若远程主机不响应，记录“连接远程主机失败”和“尝试重新连接...”，每 5 秒重试，直到恢复或会话终止。
+     - 主进程继续运行，现有连接不受影响。
 
 2. **查询会话**:
    ```bash
@@ -52,12 +54,21 @@
 
 - **日志管理**:
   - 日志轮转已自动配置（`/etc/logrotate.d/zf`），每周轮转，保留 4 个备份，压缩旧日志。
+  - 重复执行 `install.sh` 不会覆盖现有 `logrotate` 配置。
 
 - **IPv6**:
-  - 若使用 `-v6` 或 `-both`，确保系统和网络支持 IPv6。
+  - 若使用 `-v6` 或 `-both`，确保系统和网络支持 IPv6.
+
+- **网络**:
+  - 安装需要访问 https://raw.githubusercontent.com/R1tain/zf/refs/heads/main/zf.c 下载 `zf.c`。
+  - 若网络受限，可配置代理：
+    ```bash
+    export http_proxy=http://<proxy>:<port>
+    export https_proxy=http://<proxy>:<port>
+    ```
 
 - **环境**:
-  - 测试于 Ubuntu 22.04，确保 `gcc` 和 `libcap2-bin` 已安装。
+  - 测试于 Ubuntu 22.04，确保 `gcc`、`libcap2-bin` 和 `curl` 已安装。
   - 内核版本需高于 3.7（支持 `TCP_FASTOPEN`，若不支持自动禁用）。
 
 ## 编译和安装
