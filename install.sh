@@ -14,7 +14,7 @@ readonly BIN_DIR="${INSTALL_PREFIX}/bin"
 readonly SESSION_DIR="/var/run/zf_sessions"
 readonly LOG_FILE="/var/log/zf.log"
 readonly LOGROTATE_CONF="/etc/logrotate.d/zf"
-readonly README_FILE="$(pwd)/README.md"
+readonly README_FILE="$(pwd)/README.md" # 使用文档将生成在当前目录
 
 # --- 颜色定义 ---
 readonly COLOR_RESET='\033[0m'
@@ -54,15 +54,15 @@ install_dependencies() {
     if ! command -v apt-get &> /dev/null; then
         log_error "此脚本目前仅支持基于 Debian/Ubuntu 的系统 (使用 apt)。"
     fi
-    apt-get update
-    apt-get install -y gcc libcap2-bin curl
+    apt-get update -qq
+    apt-get install -y -qq gcc libcap2-bin curl
 }
 
 # 下载并编译
 compile_source() {
     log_info "正在从 ${COLOR_BLUE}${ZF_URL}${COLOR_RESET} 下载源码..."
-    # 使用 curl 下载最新版本的 zf.c
-    curl -fsSL -o "$SRC_FILE" "https://gist.githubusercontent.com/GoogleCloudPlatform/5f3c9a1841361c479373989a31a54b35/raw/zf.c"
+    # 使用 curl 从 ZF_URL 变量指定的地址下载 zf.c
+    curl -fsSL -o "$SRC_FILE" "$ZF_URL"
 
     log_info "正在编译 ${COLOR_CYAN}${SRC_FILE}${COLOR_RESET} (使用 -pthread)..."
     # 添加了 -pthread 标志来链接线程库
@@ -85,11 +85,10 @@ install_files() {
     chmod 644 "$LOG_FILE"
 
     log_info "正在为 ${COLOR_CYAN}zf${COLOR_RESET} 设置 ICMP 权限..."
-    # 为程序赋予捕获网络原始数据包的能力，使其可以在非root用户下运行ICMP质量监控
     setcap cap_net_raw+ep "${BIN_DIR}/${BIN_NAME}" || log_warn "setcap 失败。ICMP 质量监控可能需要 root 权限运行。"
 
     configure_logrotate
-    generate_readme
+    generate_readme # 调用函数生成使用说明文档
 }
 
 # 配置日志轮转
@@ -111,86 +110,125 @@ EOF
     fi
 }
 
-# 生成说明文档 (已更新为最新内容)
+# 生成使用说明文档 (README.md)
 generate_readme() {
-    log_info "正在生成说明文档 ${COLOR_CYAN}README.md${COLOR_RESET}..."
-    local a='`'
+    log_info "正在生成使用说明文档到当前目录: ${COLOR_CYAN}${README_FILE}${COLOR_RESET}..."
+    local a='`' # For use in heredoc to avoid issues with backticks
     local code_block="${a}${a}${a}"
 
     cat > "$README_FILE" << EOF
 # zf Port Forwarding Tool
 
-\`zf\` 是一个基于 Linux 系统调用的端口转发工具，支持 TCP 和 UDP 转发，IPv4 和 IPv6，具备会话管理、超时清理和链路质量监控功能。
+\`zf\` 是一个基于 Linux 系统调用的端口转发工具，主要支持 TCP 转发，兼容 IPv4 和 IPv6，并具备会话管理、超时清理和基础的远程主机健康检查功能。
 
 ## 文件位置
 
-- **日志文件位置**:
-  - \`/var/log/zf.log\`
-  - 记录会话状态、连接超时、链路延迟等信息。
-
-- **会话文件位置**:
-  - \`/var/run/zf_sessions/\`
-  - 存储会话信息（\`.session\` 文件）和控制套接字（\`.sock\` 文件）。
-  - 关闭会话后，\`.session\` 和 \`.sock\` 文件会被删除。
-
-- **编译位置**:
-  - 当前文件夹（执行 \`install.sh\` 的目录）
-  - 源文件 \`zf.c\` 从网上下载并在此编译生成可执行文件 \`zf\`.
-
-- **编译后文件位置**:
-  - \`/usr/local/bin/zf\`
+- **可执行文件**:
+  - \`${BIN_DIR}/${BIN_NAME}\`
   - 编译后的可执行文件安装到此路径，可全局运行。
+
+- **日志文件**:
+  - \`${LOG_FILE}\`
+  - 记录程序运行状态、会话建立与关闭、连接超时、健康检查结果等信息。
+
+- **会话管理目录**:
+  - \`${SESSION_DIR}/\`
+  - 存储活动会话的信息文件（\`.session\` 文件）和用于控制的套接字文件（\`.sock\` 文件）。
+  - 当会话通过 \`zf -k <session_id>\` 或程序正常退出时，相关文件会被清理。
+
+- **日志轮转配置**:
+  - \`${LOGROTATE_CONF}\`
+  - 用于管理 \`${LOG_FILE}\` 的自动轮转，防止日志文件过大。
 
 ## 使用说明
 
-1. **新建会话**:
-   ${code_block}bash
-   zf v4 0.0.0.0:8080 example.com:80 -p tcp -c 30 -t 300
-   ${code_block}
-   - 转发 IPv4 的 TCP 流量到 \`example.com:80\`。
-   - \`-t 300\`：300 秒空闲后关闭连接。
-   - \`-c 30\`：每 30 秒检查远程主机连通性。
+### 1. 启动新的转发会话
 
-2. **查询会话**:
-   ${code_block}bash
-   zf -ls
-   ${code_block}
-   - 列出活动会话及其当前的连接和流量统计。
+基本语法：
+${code_block}bash
+sudo zf <ip_version> <local_addr>:<local_port> <remote_addr>:<remote_port> [options]
+${code_block}
 
-3. **关闭会话**:
-   ${code_block}bash
-   zf -k <session_id>
-   ${code_block}
-   - 终止指定会话，清理 \`.session\` 和 \`.sock\` 文件。
+**参数详解**:
+- \`<ip_version>\`: IP 协议版本。
+  - \`v4\`: 仅监听和转发 IPv4。
+  - \`v6\`: 仅监听和转发 IPv6。
+- \`<local_addr>:<local_port>\`: 本地监听的地址和端口。
+  - 示例: \`0.0.0.0:8080\` (监听所有IPv4接口的8080端口), \`[::]:8080\` (监听所有IPv6接口的8080端口)。
+- \`<remote_addr>:<remote_port>\`: 远程目标服务器的地址和端口。
+  - 示例: \`example.com:80\`, \`192.168.1.100:443\`。
+- \`[options]\`: 可选参数。
+  - \`-p <protocol>\`: 转发的协议。当前稳定版本主要支持 \`tcp\` (这也是默认值)。
+  - \`-c <interval>\`: 远程主机健康检查的间隔时间（秒）。默认30秒。若连续10次检查失败，会话将自动终止。
+  - \`-t <timeout>\`: 连接空闲超时时间（秒）。默认300秒。如果一个已建立的转发连接在这个时间内没有任何数据活动，它将被关闭。
 
-4. **显示帮助**:
-   ${code_block}bash
-   zf -h
-   ${code_block}
-   - 显示详细帮助信息，包括所有参数和示例。
+**示例**:
+将所有进入本地IPv4地址的 \`33669\` 端口的TCP流量，转发到 \`103.214.23.219\` 服务器的 \`33669\` 端口，健康检查间隔60秒，连接超时180秒：
+${code_block}bash
+sudo zf v4 0.0.0.0:33669 103.214.23.219:33669 -c 60 -t 180
+${code_block}
+
+程序将作为守护进程在后台运行。会话ID和守护进程PID会在启动时打印到控制台。
+
+### 2. 查询当前活动会话
+
+${code_block}bash
+zf -ls
+${code_block}
+该命令会列出所有当前正在运行的 \`zf\` 会话的配置信息，如ID, PID, 监听地址，目标地址等。
+注意：在此版本的 `zf -ls` 输出中，"Note: Live stats are not available in this version." 表示实时的连接数和流量统计功能未包含。
+
+### 3. 关闭指定会话
+
+${code_block}bash
+sudo zf -k <session_id>
+${code_block}
+- \`<session_id>\`: 通过 \`zf -ls\` 命令获取到的会话ID。
+该命令会向指定的 \`zf\` 守护进程发送关闭信号，使其优雅地终止并清理相关资源。
+
+### 4. 显示帮助信息
+
+${code_block}bash
+zf -h
+zf -h --verbose
+${code_block}
+显示基本或详细的帮助信息，包括所有参数和用法说明。
 
 ## 注意事项
 
 - **权限**:
-  - 安装需 root 权限（\`sudo ./install.sh\`）。
-  - ICMP 监控需要 \`CAP_NET_RAW\` 权限，安装脚本已通过 \`setcap\` 自动设置。如果失败，该功能可能需要 root 权限。
+  - 安装脚本 \`install.sh\` 和运行 \`zf -k\`，以及启动 \`zf\` 守护进程通常需要 \`sudo\` (root) 权限，因为需要操作 \`/usr/local/bin\`, \`/var/run\`, \`/var/log\`, \`/etc/logrotate.d\` 等目录，并且监听低于1024的端口也需要特权。
+  - ICMP 健康检查功能（如果未来版本中包含更高级的ICMP探测）可能需要 \`CAP_NET_RAW\` 权限。安装脚本已尝试通过 \`setcap\` 为可执行文件赋予此权限。
 
 - **日志管理**:
-  - 日志轮转已自动配置（\`/etc/logrotate.d/zf\`），每周轮转，保留 4 个备份，压缩旧日志。
-  - 重复执行 \`install.sh\` 不会覆盖现有 \`logrotate\` 配置。
+  - 日志轮转通过 \`/etc/logrotate.d/zf\` 文件自动配置，默认每周轮转，保留4个备份，并对旧日志进行压缩。
 
 - **网络**:
-  - 安装脚本需要访问互联网以下载源码。
+  - 安装脚本需要访问互联网以下载 \`${SRC_FILE}\` 源码。
+  - 确保防火墙规则允许相关的出入站连接。
 
-## 编译和安装
+## 安装与卸载
 
-运行以下命令编译和安装：
+### 安装
+1.  确保系统已安装 \`curl\`, \`gcc\`, \`libcap2-bin\`。脚本会自动尝试安装。
+2.  下载 \`install.sh\` 脚本。
+3.  赋予执行权限: \`chmod +x install.sh\`
+4.  运行安装: \`sudo ./install.sh\`
+
+### 卸载
+运行以下命令进行卸载：
 ${code_block}bash
-chmod +x install.sh
-sudo ./install.sh
+sudo ./install.sh uninstall
+${code_block}
+这将移除已安装的 \`${BIN_NAME}\` 二进制文件、logrotate配置文件和主日志文件。会话目录和旧的日志备份可能需要手动检查和删除。
+
+## 清理编译文件
+运行以下命令仅清理当前目录下载的源码和编译产生的临时文件：
+${code_block}bash
+./install.sh clean
 ${code_block}
 
-安装完成后，\`zf\` 可全局运行，日志和会话文件按上述路径存储。
+---
 EOF
 }
 
@@ -201,29 +239,29 @@ stop_all_zf_sessions() {
     if command -v zf &> /dev/null; then
         log_info "尝试使用 '${COLOR_CYAN}zf -k${COLOR_RESET}' 优雅地关闭所有会话..."
         # 修正了从 zf -ls 输出中提取会话ID的命令
-        SESSION_IDS=$(zf -ls | grep '^ID:' | awk '{print $2}' || true)
+        SESSION_IDS=$(zf -ls 2>/dev/null | grep '^ID:' | awk '{print $2}' || true) # Suppress zf -ls errors if no sessions
         if [ -n "$SESSION_IDS" ]; then
             echo "$SESSION_IDS" | while read -r session_id; do
                 if [ -n "$session_id" ]; then
                     log_info "正在关闭会话: ${COLOR_YELLOW}${session_id}${COLOR_RESET}"
                     # 使用 timeout 防止 zf -k 卡住
-                    timeout 5 zf -k "$session_id" || log_warn "关闭会话 ${COLOR_YELLOW}${session_id}${COLOR_RESET} 失败，可能已被终止或超时。"
+                    timeout 5s zf -k "$session_id" || log_warn "关闭会话 ${COLOR_YELLOW}${session_id}${COLOR_RESET} 失败，可能已被终止或超时。"
                 fi
             done
         else
-            log_info "未发现通过 'zf -ls' 枚举到的会话。"
+            log_info "未发现通过 'zf -ls' 枚举到的活动会话。"
         fi
         sleep 1
     fi
 
     if pgrep -x zf > /dev/null; then
         log_info "检测到残留 ${COLOR_CYAN}zf${COLOR_RESET} 进程，尝试优雅终止 (${COLOR_YELLOW}SIGTERM${COLOR_RESET})..."
-        pkill zf 2>/dev/null || true
-        sleep 2
+        pkill zf 2>/dev/null || true # Allow command to fail if no process found
+        sleep 2 # Give time for graceful shutdown
 
         if pgrep -x zf > /dev/null; then
             log_warn "优雅终止失败，强制终止 (${COLOR_RED}SIGKILL${COLOR_RESET})..."
-            pkill -9 zf 2>/dev/null || true
+            pkill -9 zf 2>/dev_null || true # Allow command to fail
             sleep 1
         fi
     fi
@@ -237,8 +275,8 @@ stop_all_zf_sessions() {
 
 # 清理临时文件
 cleanup() {
-    log_info "正在清理临时文件 (${COLOR_CYAN}${SRC_FILE}${COLOR_RESET})..."
-    # 在脚本退出前不删除可执行文件，因为install_files会移动它
+    log_info "正在清理临时文件 (源码: ${COLOR_CYAN}${SRC_FILE}${COLOR_RESET})..."
+    # 编译生成的可执行文件 BIN_NAME 在 install_files 中已被移动，此处无需清理
     rm -f "$SRC_FILE"
 }
 
@@ -247,24 +285,25 @@ uninstall() {
     log_info "正在卸载 ${COLOR_CYAN}zf${COLOR_RESET}..."
     rm -f "${BIN_DIR}/${BIN_NAME}"
     rm -f "$LOGROTATE_CONF"
-    rm -f "$LOG_FILE"
-    log_warn "二进制文件和配置文件已删除。"
+    # rm -f "$LOG_FILE" # 通常卸载时不删除主日志文件，用户可能需要保留
+    log_info "二进制文件 ${COLOR_BLUE}${BIN_DIR}/${BIN_NAME}${COLOR_RESET} 已删除。"
+    log_info "logrotate 配置文件 ${COLOR_BLUE}${LOGROTATE_CONF}${COLOR_RESET} 已删除。"
+    log_warn "主日志文件 ${COLOR_BLUE}${LOG_FILE}${COLOR_RESET} 未删除，如有需要请手动处理。"
     log_warn "请手动检查并删除会话目录: ${COLOR_BLUE}${SESSION_DIR}${COLOR_RESET}"
-    log_warn "旧的日志文件可能仍然存在于 ${COLOR_BLUE}/var/log/${COLOR_RESET} 中。"
     log_info "卸载完成。"
 }
 
 # 帮助信息
 show_help() {
     echo -e "用法: ${COLOR_CYAN}$0 [install|uninstall|clean]${COLOR_RESET}"
-    echo -e "  ${COLOR_YELLOW}install${COLOR_RESET}    (默认) 下载、编译并安装 zf。"
+    echo -e "  ${COLOR_YELLOW}install${COLOR_RESET}    (默认) 下载、编译并安装 zf，并生成使用说明。"
     echo -e "  ${COLOR_YELLOW}uninstall${COLOR_RESET}  卸载 zf 并移除相关配置。"
-    echo -e "  ${COLOR_YELLOW}clean${COLOR_RESET}      仅清理当前目录的临时文件。"
+    echo -e "  ${COLOR_YELLOW}clean${COLOR_RESET}      仅清理当前目录下载的源码和编译产生的二进制文件。"
 }
 
 # --- 主逻辑 ---
 main() {
-    action=${1:-install}
+    action=${1:-install} # Default action is install
 
     case "$action" in
         install)
@@ -272,20 +311,24 @@ main() {
             stop_all_zf_sessions
             install_dependencies
             compile_source
-            install_files
+            install_files # This function now also calls generate_readme
             cleanup
             log_info "${COLOR_GREEN}安装完成！${COLOR_RESET}"
+            log_info "使用 '${COLOR_CYAN}zf -h${COLOR_RESET}' 查看帮助。"
+            log_info "使用说明文档已生成到当前目录: ${COLOR_BLUE}${README_FILE}${COLOR_RESET}"
             log_info "使用 '${COLOR_CYAN}zf -ls${COLOR_RESET}' 查看会话，日志位于 ${COLOR_BLUE}${LOG_FILE}${COLOR_RESET}"
-            log_info "说明文档已生成：${COLOR_BLUE}${README_FILE}${COLOR_RESET}"
             ;;
         uninstall)
             check_root
-            stop_all_zf_sessions
+            stop_all_zf_sessions # Stop before uninstalling
             uninstall
             ;;
         clean)
+            # Cleanup doesn't need root, just cleans current dir
             cleanup
-            rm -f "$BIN_NAME"
+            log_info "正在清理当前目录编译产生的二进制文件 (${COLOR_CYAN}${BIN_NAME}${COLOR_RESET})..."
+            rm -f "$(pwd)/$BIN_NAME" # Remove compiled binary if it exists in current dir
+            log_info "清理完成。"
             ;;
         *)
             show_help
