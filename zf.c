@@ -19,8 +19,7 @@
 #include <linux/if.h>
 #include <dirent.h>
 #include <pthread.h>
-#include <pwd.h>
-#include <grp.h>
+#include <stdarg.h>
 
 #define SESSION_DIR "/var/run/zf_sessions"
 #define LOG_FILE "/var/log/zf.log"
@@ -97,14 +96,23 @@ void free_buffer(DynamicBuffer *buf) {
     }
 }
 
-void log_message(PortForwarder *f, const char *msg) {
+void log_message(PortForwarder *f, const char *fmt, ...) {
     time_t now = time(NULL);
     char timestamp[32];
     strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localtime(&now));
     FILE *fp = f->log_fp ? f->log_fp : stderr;
+
+    va_list args;
+    va_start(args, fmt);
+    char msg[1024];
+    vsnprintf(msg, sizeof(msg), fmt, args);
+    va_end(args);
+
     fprintf(fp, "%s [%s] %s\n", timestamp, f->session.id, msg);
     if (fp != stderr) fflush(fp);
 }
+
+void delete_session(PortForwarder *f);
 
 void cleanup(PortForwarder *f) {
     if (f->running) {
@@ -418,7 +426,7 @@ int check_connection(PortForwarder *f) {
     double latency = (end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_usec - start.tv_usec) / 1000.0;
     char msg[64];
     snprintf(msg, sizeof(msg), "连接正常，延迟: %.2fms", latency);
-    log_message(f, msg);
+    log_message(f, "%s", msg);
     return 1;
 }
 
@@ -479,7 +487,7 @@ void monitor_quality(PortForwarder *f) {
                 double latency = (end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_usec - start.tv_usec) / 1000.0;
                 char msg[64];
                 snprintf(msg, sizeof(msg), "链路质量: 延迟 %.2fms", latency);
-                log_message(f, msg);
+                log_message(f, "%s", msg);
             } else {
                 log_message(f, "ICMP 接收失败: %s", strerror(errno));
             }
@@ -874,22 +882,6 @@ int main(int argc, char *argv[]) {
         log_message(&f, "初始化会话失败");
         if (f.log_fp != stderr) fclose(f.log_fp);
         return 1;
-    }
-
-    if (getuid() == 0) {
-        struct passwd *pw = getpwnam("nobody");
-        struct group *gr = getgrnam("nogroup");
-        if (pw && gr) {
-            if (setgid(gr->gr_gid) != 0 || setuid(pw->pw_uid) != 0) {
-                log_message(&f, "无法切换到 nobody 用户: %s", strerror(errno));
-                if (f.log_fp != stderr) fclose(f.log_fp);
-                return 1;
-            }
-        } else {
-            log_message(&f, "无法找到 nobody 用户或 nogroup 组");
-            if (f.log_fp != stderr) fclose(f.log_fp);
-            return 1;
-        }
     }
 
     if (getenv("ZF_DAEMON") == NULL) {
