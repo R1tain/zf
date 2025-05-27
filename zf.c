@@ -76,6 +76,33 @@ void signal_handler(int sig) {
     exit(0);
 }
 
+void print_help(void) {
+    printf("zf Port Forwarding Tool\n");
+    printf("\n用法:\n");
+    printf("  zf <ip_version> <local_addr>:<local_port> <remote_addr>:<remote_port> [-p protocols] [-c interval] [-t timeout]\n");
+    printf("  zf -ls\n");
+    printf("  zf -k <session_id>\n");
+    printf("  zf -h\n");
+    printf("\n参数说明:\n");
+    printf("  <ip_version>         : IP 协议版本，可选 v4（IPv4）、v6（IPv6）、both（IPv4 和 IPv6）。\n");
+    printf("  <local_addr>:<local_port> : 本地监听地址和端口，如 0.0.0.0:8080，端口范围 1-65535。\n");
+    printf("  <remote_addr>:<remote_port> : 远程目标地址和端口，如 example.com:80，端口范围 1-65535。\n");
+    printf("  -p <protocols>       : 转发协议，可选 tcp、udp 或 tcp,udp（默认：tcp,udp）。\n");
+    printf("  -c <interval>        : 检查远程主机连通性的间隔（秒，默认：30）。\n");
+    printf("                        - 若失败，每 5 秒重试，直到恢复或会话终止。\n");
+    printf("  -t <timeout>         : 连接空闲超时时间（秒，默认：0，无超时）。\n");
+    printf("                        - 超时后关闭连接，主进程继续监听。\n");
+    printf("  -ls                  : 列出当前活动会话。\n");
+    printf("  -k <session_id>      : 终止指定会话，清理会话文件。\n");
+    printf("  -h                   : 显示此帮助信息。\n");
+    printf("\n示例:\n");
+    printf("  zf v4 0.0.0.0:8080 example.com:80 -p tcp,udp -c 30 -t 30\n");
+    printf("  zf -ls\n");
+    printf("  zf -k 12345-0.0.0.0:8080-1623456789\n");
+    printf("  zf -h\n");
+    printf("\n日志存储在 /var/log/zf.log，由 /etc/logrotate.d/zf 管理（每周轮转，保留 4 个备份）。\n");
+}
+
 int create_socket(const char *addr, int port, const char *ip_version, const char *proto) {
     int family = (strcmp(ip_version, "v6") == 0) ? AF_INET6 : AF_INET;
     int type = (strcmp(proto, "tcp") == 0) ? SOCK_STREAM : SOCK_DGRAM;
@@ -168,7 +195,7 @@ void handle_tcp_connection(PortForwarder *f, int client_fd, const char *remote_h
         } else if (ret == 0 && f->session.timeout) {
             if (time(NULL) - last_activity >= f->session.timeout) {
                 log_message(f, "TCP 连接空闲超时，关闭连接");
-                break; // 仅关闭当前连接
+                break;
             }
             continue;
         }
@@ -220,7 +247,7 @@ void handle_udp(PortForwarder *f, int local_fd, const char *remote_host, int rem
         } else if (ret == 0 && f->session.timeout) {
             if (time(NULL) - last_activity >= f->session.timeout) {
                 log_message(f, "UDP 连接空闲超时，关闭连接");
-                break; // 仅关闭当前连接
+                break;
             }
             continue;
         }
@@ -538,9 +565,7 @@ void kill_session(const char *session_id) {
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        printf("用法: zf <ip_version> <local_addr>:<local_port> <remote_addr>:<remote_port> [-p protocols] [-c interval] [-t timeout]\n");
-        printf("示例: zf v4 0.0.0.0:8080 example.com:80 -p tcp,udp -c 30 -t 30\n");
-        printf("其他命令: zf -ls (列出会话), zf -k <session_id> (关闭会话)\n");
+        print_help();
         return 1;
     }
 
@@ -562,6 +587,7 @@ int main(int argc, char *argv[]) {
     char *protocols = "tcp,udp";
     int check_interval = 30;
     int timeout = 0;
+    int help_flag = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-ls") == 0) {
@@ -574,7 +600,15 @@ int main(int argc, char *argv[]) {
             check_interval = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
             timeout = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-h") == 0) {
+            help_flag = 1;
         }
+    }
+
+    if (help_flag) {
+        print_help();
+        fclose(f.log_fp);
+        return 0;
     }
 
     if (list_sessions_flag) {
@@ -591,6 +625,7 @@ int main(int argc, char *argv[]) {
 
     if (argc < 4) {
         fprintf(stderr, "缺少必要参数\n");
+        print_help();
         fclose(f.log_fp);
         return 1;
     }
