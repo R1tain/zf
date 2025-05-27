@@ -16,7 +16,7 @@
 #include <time.h>
 #include <netdb.h>
 #include <linux/icmp.h>
-#include <linux/if_ether.h>
+#include <linux/if.h>
 #include <dirent.h>
 
 #define SESSION_DIR "/var/run/zf_sessions"
@@ -43,7 +43,11 @@ typedef struct {
     int running;
     FILE *log_fp;
     int control_fd;
+    pid_t check_pid;
+    pid_t quality_pid;
 } PortForwarder;
+
+static PortForwarder *global_f = NULL;
 
 void log_message(PortForwarder *f, const char *msg) {
     time_t now = time(NULL);
@@ -51,6 +55,25 @@ void log_message(PortForwarder *f, const char *msg) {
     strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localtime(&now));
     fprintf(f->log_fp, "%s - %s\n", timestamp, msg);
     fflush(f->log_fp);
+}
+
+void cleanup(PortForwarder *f) {
+    if (f->running) {
+        f->running = 0;
+        if (f->check_pid > 0) kill(f->check_pid, SIGTERM);
+        if (f->quality_pid > 0) kill(f->quality_pid, SIGTERM);
+        delete_session(f);
+        if (f->control_fd >= 0) close(f->control_fd);
+        if (f->log_fp) fclose(f->log_fp);
+    }
+}
+
+void signal_handler(int sig) {
+    if (global_f) {
+        log_message(global_f, "收到信号，终止会话");
+        cleanup(global_f);
+    }
+    exit(0);
 }
 
 int create_socket(const char *addr, int port, const char *ip_version, const char *proto) {
@@ -242,7 +265,8 @@ void monitor_quality(PortForwarder *f) {
     int sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
     if (sock < 0) {
         log_message(f, "无法创建 ICMP 套接字");
-        return;
+        fclose(f->log_fp);
+        exit(0);
     }
 
     struct sockaddr_in addr = {0};
@@ -275,6 +299,8 @@ void monitor_quality(PortForwarder *f) {
         sleep(60);
     }
     close(sock);
+    fclose(f->log_fp);
+    exit(0);
 }
 
 void save_session(PortForwarder *f) {
@@ -316,9 +342,7 @@ void handle_control_socket(PortForwarder *f) {
             buffer[n] = '\0';
             if (strcmp(buffer, "kill") == 0) {
                 log_message(f, "收到关闭命令，终止会话");
-                f->running = 0;
-                delete_session(f);
-                close(client_fd);
+                cleanup(f);
                 exit(0);
             }
         }
@@ -332,6 +356,7 @@ void start_forwarding(PortForwarder *f) {
     int epoll_fd = epoll_create1(0);
     if (epoll_fd < 0) {
         log_message(f, "无法创建 epoll");
+        cleanup(f);
         exit(1);
     }
 
@@ -378,6 +403,8 @@ void start_forwarding(PortForwarder *f) {
     if (bind(f->control_fd, (struct sockaddr *)&control_addr, sizeof(control_addr)) < 0 ||
         listen(f->control_fd, 5) < 0) {
         log_message(f, "控制套接字启动失败");
+        close(epoll_fd);
+        cleanup(f);
         exit(1);
     }
     struct epoll_event ev = {0};
@@ -388,8 +415,8 @@ void start_forwarding(PortForwarder *f) {
     save_session(f);
 
     // 检查连接和监控质量
-    pid_t check_pid = fork();
-    if (check_pid == 0) {
+    f->check_pid = fork();
+    if (f->check_pid == 0) {
         while (f->running) {
             if (!check_connection(f)) {
                 log_message(f, "尝试重新连接...");
@@ -398,11 +425,12 @@ void start_forwarding(PortForwarder *f) {
                 sleep(f->session.check_interval);
             }
         }
+        fclose(f->log_fp);
         exit(0);
     }
 
-    pid_t quality_pid = fork();
-    if (quality_pid == 0) {
+    f->quality_pid = fork();
+    if (f->quality_pid == 0) {
         monitor_quality(f);
         exit(0);
     }
@@ -449,10 +477,7 @@ void start_forwarding(PortForwarder *f) {
 
     for (int i = 0; i < socket_count; i++) close(sockets[i].fd);
     close(epoll_fd);
-    close(f->control_fd);
-    unlink(control_path);
-    delete_session(f); // 确保退出时清理
-    fclose(f->log_fp);
+    cleanup(f);
 }
 
 void list_sessions() {
@@ -525,6 +550,12 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "无法打开日志文件: %s\n", LOG_FILE);
         return 1;
     }
+    f.control_fd = -1;
+    global_f = &f;
+
+    // 设置信号处理
+    signal(SIGTERM, signal_handler);
+    signal(SIGINT, signal_handler);
 
     int list_sessions_flag = 0;
     char *kill_session_id = NULL;
