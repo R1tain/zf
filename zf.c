@@ -109,17 +109,31 @@ void log_message(PortForwarder *f, const char *msg) {
 void cleanup(PortForwarder *f) {
     if (f->running) {
         f->running = 0;
-        pthread_cancel(f->check_thread);
-        pthread_cancel(f->quality_thread);
+        if (f->check_thread) {
+            pthread_cancel(f->check_thread);
+            pthread_join(f->check_thread, NULL);
+            f->check_thread = 0;
+        }
+        if (f->quality_thread) {
+            pthread_cancel(f->quality_thread);
+            pthread_join(f->quality_thread, NULL);
+            f->quality_thread = 0;
+        }
         delete_session(f);
-        if (f->control_fd >= 0) close(f->control_fd);
-        if (f->log_fp && f->log_fp != stderr) fclose(f->log_fp);
+        if (f->control_fd >= 0) {
+            close(f->control_fd);
+            f->control_fd = -1;
+        }
+        if (f->log_fp && f->log_fp != stderr) {
+            fclose(f->log_fp);
+            f->log_fp = NULL;
+        }
     }
 }
 
 void signal_handler(int sig) {
     if (global_f) {
-        log_message(global_f, "收到信号，终止会话");
+        log_message(global_f, sig == SIGUSR1 ? "连接失败策略触发，终止会话" : "收到信号，终止会话");
         cleanup(global_f);
     }
     exit(0);
@@ -410,6 +424,7 @@ int check_connection(PortForwarder *f) {
 
 void *check_connection_thread(void *arg) {
     PortForwarder *f = (PortForwarder *)arg;
+    pthread_cleanup_push((void (*)(void *))fclose, f->log_fp);
     int fail_count = 0;
     while (f->running) {
         if (!check_connection(f)) {
@@ -418,6 +433,7 @@ void *check_connection_thread(void *arg) {
             if (fail_count >= MAX_RETRIES) {
                 log_message(f, "连续 10 次连接失败，终止会话");
                 f->running = 0;
+                kill(getpid(), SIGUSR1);
                 break;
             }
             sleep(5);
@@ -426,6 +442,7 @@ void *check_connection_thread(void *arg) {
             sleep(f->session.check_interval);
         }
     }
+    pthread_cleanup_pop(1);
     return NULL;
 }
 
@@ -474,7 +491,16 @@ void monitor_quality(PortForwarder *f) {
 
 void *monitor_quality_thread(void *arg) {
     PortForwarder *f = (PortForwarder *)arg;
+    int sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (sock < 0) {
+        log_message(f, "无法创建 ICMP 套接字: %s", strerror(errno));
+        return NULL;
+    }
+    pthread_cleanup_push((void (*)(void *))close, (void *)(intptr_t)sock);
+    pthread_cleanup_push((void (*)(void *))fclose, f->log_fp);
     monitor_quality(f);
+    pthread_cleanup_pop(1);
+    pthread_cleanup_pop(1);
     return NULL;
 }
 
@@ -535,6 +561,8 @@ void handle_control_socket(PortForwarder *f) {
 int init_session(PortForwarder *f) {
     f->running = 1;
     f->control_fd = -1;
+    f->check_thread = 0;
+    f->quality_thread = 0;
     f->stats.active_connections = 0;
     f->stats.total_connections = 0;
     f->stats.bytes_transferred = 0;
@@ -810,6 +838,7 @@ int main(int argc, char *argv[]) {
 
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
+    signal(SIGUSR1, signal_handler);
 
     int list_sessions_flag = 0;
     char *kill_session_id = NULL;
