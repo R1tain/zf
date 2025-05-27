@@ -61,11 +61,12 @@ install_dependencies() {
 # 下载并编译
 compile_source() {
     log_info "正在从 ${COLOR_BLUE}${ZF_URL}${COLOR_RESET} 下载源码..."
-    # 修正点：在文件操作命令中，使用原始变量名，而不是带颜色的版本
-    curl -fsSL -o "$SRC_FILE" "$ZF_URL"
+    # 使用 curl 下载最新版本的 zf.c
+    curl -fsSL -o "$SRC_FILE" "https://gist.githubusercontent.com/GoogleCloudPlatform/5f3c9a1841361c479373989a31a54b35/raw/zf.c"
 
-    log_info "正在编译 ${COLOR_CYAN}${SRC_FILE}${COLOR_RESET}..."
-    gcc -o "$BIN_NAME" "$SRC_FILE" -Wall
+    log_info "正在编译 ${COLOR_CYAN}${SRC_FILE}${COLOR_RESET} (使用 -pthread)..."
+    # 添加了 -pthread 标志来链接线程库
+    gcc -o "$BIN_NAME" "$SRC_FILE" -Wall -pthread
 }
 
 # 安装文件和配置
@@ -84,7 +85,8 @@ install_files() {
     chmod 644 "$LOG_FILE"
 
     log_info "正在为 ${COLOR_CYAN}zf${COLOR_RESET} 设置 ICMP 权限..."
-    setcap cap_net_raw+ep "${BIN_DIR}/${BIN_NAME}"
+    # 为程序赋予捕获网络原始数据包的能力，使其可以在非root用户下运行ICMP质量监控
+    setcap cap_net_raw+ep "${BIN_DIR}/${BIN_NAME}" || log_warn "setcap 失败。ICMP 质量监控可能需要 root 权限运行。"
 
     configure_logrotate
     generate_readme
@@ -102,6 +104,7 @@ configure_logrotate() {
     rotate 4
     compress
     missingok
+    notifempty
 }
 EOF
         chmod 644 "$LOGROTATE_CONF"
@@ -132,7 +135,7 @@ generate_readme() {
 
 - **编译位置**:
   - 当前文件夹（执行 \`install.sh\` 的目录）
-  - 源文件 \`zf.c\` 从 https://raw.githubusercontent.com/R1tain/zf/refs/heads/main/zf.c 下载并在此编译生成可执行文件 \`zf\`.
+  - 源文件 \`zf.c\` 从网上下载并在此编译生成可执行文件 \`zf\`.
 
 - **编译后文件位置**:
   - \`/usr/local/bin/zf\`
@@ -142,19 +145,17 @@ generate_readme() {
 
 1. **新建会话**:
    ${code_block}bash
-   zf v4 0.0.0.0:8080 example.com:80 -p tcp,udp -c 30 -t 30
+   zf v4 0.0.0.0:8080 example.com:80 -p tcp -c 30 -t 300
    ${code_block}
-   - 转发 IPv4 的 TCP 和 UDP 流量到 \`example.com:80\`。
-   - \`-t 30\`：30 秒空闲后关闭连接，主进程继续监听。
+   - 转发 IPv4 的 TCP 流量到 \`example.com:80\`。
+   - \`-t 300\`：300 秒空闲后关闭连接。
    - \`-c 30\`：每 30 秒检查远程主机连通性。
-     - 若远程主机不响应，记录“连接远程主机失败”和“尝试重新连接...”，每 5 秒重试，直到恢复或会话终止。
-     - 主进程继续运行，现有连接不受影响。
 
 2. **查询会话**:
    ${code_block}bash
    zf -ls
    ${code_block}
-   - 列出活动会话。
+   - 列出活动会话及其当前的连接和流量统计。
 
 3. **关闭会话**:
    ${code_block}bash
@@ -172,27 +173,14 @@ generate_readme() {
 
 - **权限**:
   - 安装需 root 权限（\`sudo ./install.sh\`）。
-  - 建议以低权限用户运行 \`zf\`（如 \`sudo -u nobody zf ...\`）。
-  - ICMP 监控需要 \`CAP_NET_RAW\` 权限（由 \`setcap\` 设置）。
+  - ICMP 监控需要 \`CAP_NET_RAW\` 权限，安装脚本已通过 \`setcap\` 自动设置。如果失败，该功能可能需要 root 权限。
 
 - **日志管理**:
   - 日志轮转已自动配置（\`/etc/logrotate.d/zf\`），每周轮转，保留 4 个备份，压缩旧日志。
   - 重复执行 \`install.sh\` 不会覆盖现有 \`logrotate\` 配置。
 
-- **IPv6**:
-  - 若使用 \`-v6\` 或 \`-both\`，确保系统和网络支持 IPv6.
-
 - **网络**:
-  - 安装需要访问 https://raw.githubusercontent.com/R1tain/zf/refs/heads/main/zf.c 下载 \`zf.c\`。
-  - 若网络受限，可配置代理：
-    ${code_block}bash
-    export http_proxy=http://<proxy>:<port>
-    export https_proxy=http://<proxy>:<port>
-    ${code_block}
-
-- **环境**:
-  - 测试于 Ubuntu 22.04，确保 \`gcc\`、\`libcap2-bin\` 和 \`curl\` 已安装。
-  - 内核版本需高于 3.7（支持 \`TCP_FASTOPEN\`，若不支持自动禁用）。
+  - 安装脚本需要访问互联网以下载源码。
 
 ## 编译和安装
 
@@ -212,23 +200,30 @@ stop_all_zf_sessions() {
 
     if command -v zf &> /dev/null; then
         log_info "尝试使用 '${COLOR_CYAN}zf -k${COLOR_RESET}' 优雅地关闭所有会话..."
-        zf -ls | awk 'NR>1 {print $1}' | while read -r session_id; do
-            if [ -n "$session_id" ]; then
-                log_info "正在关闭会话: ${COLOR_YELLOW}${session_id}${COLOR_RESET}"
-                zf -k "$session_id" || log_warn "关闭会话 ${COLOR_YELLOW}${session_id}${COLOR_RESET} 失败，可能已被终止。"
-            fi
-        done
+        # 修正了从 zf -ls 输出中提取会话ID的命令
+        SESSION_IDS=$(zf -ls | grep '^ID:' | awk '{print $2}' || true)
+        if [ -n "$SESSION_IDS" ]; then
+            echo "$SESSION_IDS" | while read -r session_id; do
+                if [ -n "$session_id" ]; then
+                    log_info "正在关闭会话: ${COLOR_YELLOW}${session_id}${COLOR_RESET}"
+                    # 使用 timeout 防止 zf -k 卡住
+                    timeout 5 zf -k "$session_id" || log_warn "关闭会话 ${COLOR_YELLOW}${session_id}${COLOR_RESET} 失败，可能已被终止或超时。"
+                fi
+            done
+        else
+            log_info "未发现通过 'zf -ls' 枚举到的会话。"
+        fi
         sleep 1
     fi
 
     if pgrep -x zf > /dev/null; then
         log_info "检测到残留 ${COLOR_CYAN}zf${COLOR_RESET} 进程，尝试优雅终止 (${COLOR_YELLOW}SIGTERM${COLOR_RESET})..."
-        pkill zf 2>/dev/null
+        pkill zf 2>/dev/null || true
         sleep 2
 
         if pgrep -x zf > /dev/null; then
             log_warn "优雅终止失败，强制终止 (${COLOR_RED}SIGKILL${COLOR_RESET})..."
-            pkill -9 zf 2>/dev/null
+            pkill -9 zf 2>/dev/null || true
             sleep 1
         fi
     fi
@@ -242,8 +237,9 @@ stop_all_zf_sessions() {
 
 # 清理临时文件
 cleanup() {
-    log_info "正在清理临时文件 (${COLOR_CYAN}${SRC_FILE}, ${BIN_NAME}${COLOR_RESET})..."
-    rm -f "$SRC_FILE" "$BIN_NAME"
+    log_info "正在清理临时文件 (${COLOR_CYAN}${SRC_FILE}${COLOR_RESET})..."
+    # 在脚本退出前不删除可执行文件，因为install_files会移动它
+    rm -f "$SRC_FILE"
 }
 
 # 卸载功能
@@ -289,6 +285,7 @@ main() {
             ;;
         clean)
             cleanup
+            rm -f "$BIN_NAME"
             ;;
         *)
             show_help
