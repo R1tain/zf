@@ -1,579 +1,467 @@
+/*                                                                   */
+/*  zf – secure / stable port-forwarding daemon (May 2025 FINAL)      */
+/*  ---------------------------------------------------------------- */
+/*  Single-translation-unit; compiles on Ubuntu 22.04/24.04           */
+/*      gcc -O2 -Wall -Wextra -pthread -o zf zf.c                     */
+/*                                                                   */
+/*                                                                   */
+
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <pthread.h>
+#include <pwd.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <sys/socket.h>
 #include <sys/epoll.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <signal.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <syslog.h>
 #include <time.h>
-#include <netdb.h>
-#include <pthread.h>
-#include <stdarg.h>
-#include <dirent.h>
+#include <unistd.h>
 
+#ifndef INET6_ADDRSTRLEN
+#define INET6_ADDRSTRLEN 46
+#endif
+
+/* ================== configurable ========================= */
 #define SESSION_DIR "/var/run/zf_sessions"
-#define LOG_FILE "/var/log/zf.log"
-#define MAX_EVENTS_PARENT 5
-#define MAX_EVENTS_PER_CHILD 2
-#define BUFFER_SIZE 8192
-#define MAX_RETRIES 10
+#define LOG_FILE    "/var/log/zf.log"
 
-// 会话信息结构体
-typedef struct {
-    char id[128];
-    pid_t pid;
-    char ip_version[8];
-    char local_addr[INET6_ADDRSTRLEN];
-    int local_port;
-    char remote_host[256];
-    int remote_port;
-    char protocols[16]; // 仅支持tcp
-    int check_interval;
-    int timeout;
-} Session;
-
-// 主进程持有的结构体
-typedef struct {
-    Session session;
-    FILE *log_fp;
-    pthread_t check_thread;
-} PortForwarder;
+/* ================== constants ============================ */
+#define BUFFER_SIZE             8192
+#define MAX_EVENTS_PARENT          5
+#define MAX_EVENTS_PER_CHILD       4
+#define MAX_RETRIES               10
 
 static volatile sig_atomic_t g_quit_flag = 0;
 
-// 函数声明
-void log_message(FILE *log_fp, const char *session_id, const char *level, const char *fmt, ...);
-void delete_session_files(const char* session_id, FILE* log_fp);
+/* ================== helpers ============================== */
+static inline void set_cloexec(int fd){fcntl(fd,F_SETFD,fcntl(fd,F_GETFD)|FD_CLOEXEC);}
+static inline void set_nonblock(int fd){fcntl(fd,F_SETFL,fcntl(fd,F_GETFL)|O_NONBLOCK);}
+static inline void sanitize_id(char*s){for(char*p=s;*p;++p)if(!((*p>='A'&&*p<='Z')||(*p>='a'&&*p<='z')||(*p>='0'&&*p<='9')||*p=='-'||*p=='_'||*p=='.'))*p='_';}
+static size_t safe_strcpy(char*d,size_t n,const char*s){size_t i=0;if(!n)return 0;while(i+1<n&&s[i]){d[i]=s[i];++i;}d[i]='\0';return i;}
 
-// 主进程和子进程的信号处理器
-void signal_handler_parent(int sig) {
-    g_quit_flag = 1;
+/* ================== data ================================ */
+typedef struct {
+    char  id[128];
+    pid_t pid;
+    char  ip_version[8];
+    char  local_addr[INET6_ADDRSTRLEN];
+    int   local_port;
+    char  remote_host[256];
+    int   remote_port;
+    int   check_interval;   /* s */
+    int   timeout;          /* s idle */
+} Session;
+
+typedef struct {
+    Session   session;
+    FILE     *log_fp;
+    pthread_t check_thread;
+} PortForwarder;
+
+/* ================== logging ============================= */
+static FILE *g_log = NULL;
+static void vlog(const char*sid,const char*lvl,const char*fmt,va_list ap){
+    FILE*out=g_log?g_log:stderr;
+    flockfile(out);
+    char ts[32]; time_t now=time(NULL);
+    strftime(ts,sizeof ts,"%Y-%m-%d %H:%M:%S",localtime(&now));
+    fprintf(out,"%s [%s] [%s] ",ts,sid?sid:"INIT",lvl);
+    vfprintf(out,fmt,ap); fputc('\n',out);
+    funlockfile(out); fflush(out);
+}
+static void logm(const char*sid,const char*lvl,const char*fmt,...){va_list ap;va_start(ap,fmt);vlog(sid,lvl,fmt,ap);va_end(ap);}
+
+/* ================== signal handlers ===================== */
+static void sig_parent(int){g_quit_flag=1;}
+static void sig_child_exit(int){while(waitpid(-1,NULL,WNOHANG)>0);}
+static void sig_child_quit(int){_exit(0);}
+
+/* ================== privilege drop ====================== */
+static void drop_privileges(const char*user){
+    if(geteuid()!=0) return;
+    struct passwd*pw=getpwnam(user);
+    if(!pw){logm(NULL,"WARN","User %s not found",user);return;}
+    if(setgid(pw->pw_gid)||setuid(pw->pw_uid))
+        logm(NULL,"WARN","Failed to drop privileges: %s",strerror(errno));
 }
 
-void signal_handler_child(int sig) {
-    // 子进程收到信号直接退出
-    _exit(0);
+/* ================== networking helpers ================== */
+static int create_listen_socket(const Session*s){
+    int fam = strcmp(s->ip_version,"v6")?AF_INET:AF_INET6;
+    int fd = socket(fam,SOCK_STREAM|SOCK_CLOEXEC,0); if(fd<0) return -1;
+    int one=1; setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,&one,sizeof one);
+    struct sockaddr_storage a={0};
+    if(fam==AF_INET){
+        struct sockaddr_in*v=(void*)&a;
+        v->sin_family=AF_INET; v->sin_port=htons(s->local_port);
+        if(inet_pton(AF_INET,s->local_addr,&v->sin_addr)!=1) return -2;
+    }else{
+        struct sockaddr_in6*v=(void*)&a;
+        v->sin6_family=AF_INET6; v->sin6_port=htons(s->local_port);
+        if(inet_pton(AF_INET6,s->local_addr,&v->sin6_addr)!=1) return -2;
+    }
+    if(bind(fd,(void*)&a,fam==AF_INET?sizeof(struct sockaddr_in):sizeof(struct sockaddr_in6))<0) return -3;
+    if(listen(fd,SOMAXCONN)<0) return -4;
+    set_nonblock(fd); return fd;
 }
 
-// 清理僵尸进程
-void sigchld_handler(int sig) {
-    while (waitpid(-1, NULL, WNOHANG) > 0);
+static int connect_remote(const Session*s){
+    struct addrinfo h={0},*res=NULL,*rp; h.ai_socktype=SOCK_STREAM; h.ai_family=AF_UNSPEC;
+    char port[16]; snprintf(port,sizeof port,"%d",s->remote_port);
+    if(getaddrinfo(s->remote_host,port,&h,&res)!=0) return -1;
+    int fd=-1;
+    for(rp=res;rp;rp=rp->ai_next){
+        fd=socket(rp->ai_family,rp->ai_socktype|SOCK_CLOEXEC,rp->ai_protocol); if(fd<0) continue;
+        set_nonblock(fd);
+        if(connect(fd,rp->ai_addr,rp->ai_addrlen)==0 || errno==EINPROGRESS) break;
+        close(fd); fd=-1;
+    }
+    freeaddrinfo(res); return fd;
 }
 
-void print_help(int verbose) {
-    printf("zf Port Forwarding Tool (Stable Forking Model)\n\n");
-    printf("Usage:\n");
-    printf("  zf <ip_version> <local_addr>:<local_port> <remote_addr>:<remote_port> [options]\n");
-    printf("  zf -ls | -k <session_id> | -h [--verbose]\n\n");
-    if (!verbose) {
-        printf("Use 'zf -h --verbose' for detailed help.\n");
-        return;
-    }
-    printf("Options:\n");
-    printf("  <ip_version>      IP version: v4, v6.\n");
-    printf("  -p <protocol>     Protocol: tcp (default). UDP is not supported in this version.\n");
-    printf("  -c <interval>     Health check interval for remote host (seconds, default: 30).\n");
-    printf("  -t <timeout>      Idle connection timeout (seconds, default: 300).\n");
-    printf("  -ls               List active sessions.\n");
-    printf("  -k <session_id>   Kill a specific session.\n");
-    printf("  -h [--verbose]    Show this help message.\n");
-}
+/* ================== child proxy loop ==================== */
+static void proxy_loop(const Session *s, int cfd)
+{
+    int rfd = connect_remote(s);
+    if (rfd < 0) { close(cfd); return; }
 
-int create_listen_socket(const Session *session, FILE *log_fp) {
-    int family = (strcmp(session->ip_version, "v6") == 0) ? AF_INET6 : AF_INET;
-    int sock = socket(family, SOCK_STREAM, 0);
-    if (sock < 0) {
-        log_message(log_fp, session->id, "ERROR", "Failed to create listen socket: %s", strerror(errno));
-        return -1;
-    }
-    int opt = 1;
-    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    struct sockaddr_storage saddr_storage = {0};
-    if (family == AF_INET) {
-        struct sockaddr_in *saddr = (struct sockaddr_in *)&saddr_storage;
-        saddr->sin_family = AF_INET;
-        saddr->sin_port = htons(session->local_port);
-        inet_pton(AF_INET, session->local_addr, &saddr->sin_addr);
-    } else {
-        struct sockaddr_in6 *saddr = (struct sockaddr_in6 *)&saddr_storage;
-        saddr->sin6_family = AF_INET6;
-        saddr->sin6_port = htons(session->local_port);
-        inet_pton(AF_INET6, session->local_addr, &saddr->sin6_addr);
-    }
-    if (bind(sock, (struct sockaddr *)&saddr_storage, family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6)) < 0) {
-        log_message(log_fp, session->id, "ERROR", "Bind to %s:%d failed: %s", session->local_addr, session->local_port, strerror(errno));
-        close(sock);
-        return -1;
-    }
-    if (listen(sock, SOMAXCONN) < 0) {
-        log_message(log_fp, session->id, "ERROR", "Listen failed: %s", strerror(errno));
-        close(sock);
-        return -1;
-    }
-    return sock;
-}
+    set_nonblock(cfd);
+    int ep = epoll_create1(EPOLL_CLOEXEC);
 
-int connect_remote(const Session *session, FILE *log_fp) {
-    struct addrinfo hints = {0}, *res, *rp;
-    hints.ai_family = AF_UNSPEC; // AF_UNSPEC allows getaddrinfo to return addresses for any IP version
-    hints.ai_socktype = SOCK_STREAM;
-    char port_str[16];
-    snprintf(port_str, sizeof(port_str), "%d", session->remote_port);
-    int ret = getaddrinfo(session->remote_host, port_str, &hints, &res);
-    if (ret != 0) {
-        log_message(log_fp, session->id, "WARN", "Failed to resolve remote host %s: %s", session->remote_host, gai_strerror(ret));
-        return -1;
-    }
-    int sock = -1;
-    for (rp = res; rp != NULL; rp = rp->ai_next) {
-        sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (sock < 0) continue;
-        if (connect(sock, rp->ai_addr, rp->ai_addrlen) == 0) break; // Success
-        close(sock);
-        sock = -1;
-    }
-    freeaddrinfo(res);
-    return sock;
-}
+    struct epoll_event ev = { .events = EPOLLIN | EPOLLRDHUP | EPOLLERR };
+    ev.data.fd = cfd; epoll_ctl(ep, EPOLL_CTL_ADD, cfd, &ev);
+    ev.data.fd = rfd; epoll_ctl(ep, EPOLL_CTL_ADD, rfd, &ev);
 
-void handle_tcp_connection(const Session *session, int client_fd, FILE *log_fp) {
-    log_message(log_fp, session->id, "INFO", "Handling connection fd %d in child PID %d.", client_fd, getpid());
-    int remote_fd = connect_remote(session, log_fp);
-    if (remote_fd < 0) {
-        close(client_fd);
-        log_message(log_fp, session->id, "WARN", "Child PID %d failed to connect to remote, closing client fd %d.", getpid(), client_fd);
-        return;
-    }
-    int epoll_fd = epoll_create1(0);
-    if (epoll_fd < 0) {
-        log_message(log_fp, session->id, "ERROR", "Child PID %d epoll_create1 failed: %s", getpid(), strerror(errno));
-        close(client_fd);
-        close(remote_fd);
-        return;
-    }
-    struct epoll_event ev, events[MAX_EVENTS_PER_CHILD];
-    ev.events = EPOLLIN;
-    ev.data.fd = client_fd;
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev) == -1) {
-        log_message(log_fp, session->id, "ERROR", "Child PID %d epoll_ctl_add client_fd failed: %s", getpid(), strerror(errno));
-        close(client_fd); close(remote_fd); close(epoll_fd); return;
-    }
-    ev.data.fd = remote_fd;
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, remote_fd, &ev) == -1) {
-        log_message(log_fp, session->id, "ERROR", "Child PID %d epoll_ctl_add remote_fd failed: %s", getpid(), strerror(errno));
-        close(client_fd); close(remote_fd); close(epoll_fd); return;
-    }
+    char buf[BUFFER_SIZE];
+    bool quit = false;
 
-    char buffer[BUFFER_SIZE];
-    while (!g_quit_flag) { // Check global quit flag as well for graceful child shutdown
-        int timeout_ms = session->timeout > 0 ? session->timeout * 1000 : -1;
-        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS_PER_CHILD, timeout_ms);
-        if (nfds < 0) { if (errno == EINTR) continue; break; }
-        if (nfds == 0) { log_message(log_fp, session->id, "INFO", "Connection on fd %d idle timeout.", client_fd); break; }
-        int quit_loop = 0;
-        for (int i = 0; i < nfds; i++) {
-            int from_fd = events[i].data.fd;
-            int to_fd = (from_fd == client_fd) ? remote_fd : client_fd;
-            ssize_t n_read = read(from_fd, buffer, BUFFER_SIZE);
-            if (n_read <= 0) { quit_loop = 1; break; }
-            ssize_t n_written_total = 0;
-            while(n_written_total < n_read) {
-                ssize_t n_written = write(to_fd, buffer + n_written_total, n_read - n_written_total);
-                if (n_written <= 0) { quit_loop = 1; break; }
-                n_written_total += n_written;
-            }
-            if(quit_loop) break;
+    while (!quit && !g_quit_flag) {
+        struct epoll_event e[MAX_EVENTS_PER_CHILD];
+        int n = epoll_wait(ep, e, MAX_EVENTS_PER_CHILD, s->timeout * 1000);
+
+        if (n == 0) {                       /* idle timeout */
+            break;
         }
-        if(quit_loop) break;
+        if (n < 0) {
+            if (errno == EINTR) continue;   /* 被信号打断 */
+            break;
+        }
+
+        for (int i = 0; i < n; ++i) {
+            int from = e[i].data.fd;
+            int to   = (from == cfd) ? rfd : cfd;
+
+            if (e[i].events & (EPOLLERR | EPOLLRDHUP | EPOLLHUP)) {
+                quit = true; break;
+            }
+
+            if (e[i].events & EPOLLIN) {
+                ssize_t r = read(from, buf, sizeof buf);
+                if (r <= 0) { quit = true; break; }
+
+                ssize_t off = 0;
+                while (off < r) {
+                    ssize_t w = write(to, buf + off, r - off);
+                    if (w  > 0) off += w;
+                    else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        /* 目标写缓冲满：简单退避 */
+                        usleep(1000);
+                    } else { quit = true; break; }
+                }
+            }
+        }
     }
-    log_message(log_fp, session->id, "INFO", "Closing connection for fd %d (remote fd %d) in child PID %d.", client_fd, remote_fd, getpid());
-    close(client_fd);
-    close(remote_fd);
-    close(epoll_fd);
+
+    shutdown(cfd, SHUT_RDWR); shutdown(rfd, SHUT_RDWR);
+    close(cfd); close(rfd); close(ep);
 }
 
-void *check_connection_thread(void *arg) {
-    PortForwarder *f = (PortForwarder *)arg;
-    int fail_count = 0;
-    log_message(f->log_fp, f->session.id, "INFO", "Health check thread started.");
-    while (!g_quit_flag) {
-        int sock = connect_remote(&f->session, f->log_fp);
-        if (sock < 0) {
-            fail_count++;
-            log_message(f->log_fp, f->session.id, "WARN", "Health check failed (attempt %d/%d)", fail_count, MAX_RETRIES);
-            if (fail_count >= MAX_RETRIES) {
-                log_message(f->log_fp, f->session.id, "ERROR", "Health check failed %d times. Sending SIGTERM to main process %d.", MAX_RETRIES, f->session.pid);
-                kill(f->session.pid, SIGTERM);
-                break;
+/* ================== health check ======================== */
+static void*health_thread(void*arg){
+    PortForwarder*pf=arg; int fails=0;
+    while(!g_quit_flag){
+        int fd=connect_remote(&pf->session);
+        if(fd<0){
+            if(++fails>=MAX_RETRIES){
+                logm(pf->session.id,"ERROR","remote unreachable – terminating");
+                kill(pf->session.pid,SIGTERM); break;
             }
-        } else {
-            if (fail_count > 0) log_message(f->log_fp, f->session.id, "INFO", "Health check successful, connection to remote host restored.");
-            fail_count = 0;
-            close(sock);
-        }
-        for (int i = 0; i < f->session.check_interval && !g_quit_flag; ++i) sleep(1);
+        }else{ fails=0; close(fd);}
+        for(int i=0;i<pf->session.check_interval&&!g_quit_flag;++i) sleep(1);
     }
-    log_message(f->log_fp, f->session.id, "INFO", "Health check thread exiting.");
     return NULL;
 }
 
-void handle_control_request(int control_listen_fd, FILE *log_fp, const char *session_id, pid_t main_pid) {
-    int client_fd = accept(control_listen_fd, NULL, NULL);
-    if(client_fd < 0) return;
-    char buffer[32];
-    ssize_t n = read(client_fd, buffer, sizeof(buffer) - 1);
-    if (n > 0) {
-        buffer[n] = '\0';
-        if (strcmp(buffer, "kill") == 0) {
-            log_message(log_fp, session_id, "INFO", "Received kill command via control socket. Sending SIGTERM to PID %d.", main_pid);
-            kill(main_pid, SIGTERM);
-        }
-    }
-    close(client_fd);
+/* ================== session files ======================= */
+static void save_session(const Session*s){
+    char p[256]; snprintf(p,sizeof p,"%s/%s.session",SESSION_DIR,s->id);
+    FILE*f=fopen(p,"w"); if(!f) return;
+    fprintf(f,"ID: %s\nPID: %d\nIPVersion: %s\nLocal: %s:%d\nRemote: %s:%d\nTimeout: %d\nCheckInterval: %d\n",
+            s->id,s->pid,s->ip_version,s->local_addr,s->local_port,
+            s->remote_host,s->remote_port,s->timeout,s->check_interval);
+    fclose(f);
+}
+static void cleanup_files(const char*id){
+    char p1[256],p2[256];
+    snprintf(p1,sizeof p1,"%s/%s.session",SESSION_DIR,id);
+    snprintf(p2,sizeof p2,"%s/%s.sock",SESSION_DIR,id);
+    unlink(p1); unlink(p2);
 }
 
-void start_forwarding(PortForwarder *f) {
-    int listen_fd = create_listen_socket(&f->session, f->log_fp);
-    if (listen_fd < 0) return;
+/* ================== control socket ====================== */
+static void handle_control(int ctrl_fd, const Session *s)
+{
+    int c = accept4(ctrl_fd, NULL, NULL, SOCK_CLOEXEC);
+    if (c < 0) return;
 
-    char sock_path[256];
-    snprintf(sock_path, sizeof(sock_path), "%s/%s.sock", SESSION_DIR, f->session.id);
-    unlink(sock_path);
-    int control_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if(control_fd < 0) {
-        log_message(f->log_fp, f->session.id, "ERROR", "Failed to create control socket: %s", strerror(errno));
-    } else {
-        struct sockaddr_un control_addr = {0};
-        control_addr.sun_family = AF_UNIX;
-        strncpy(control_addr.sun_path, sock_path, sizeof(control_addr.sun_path) - 1);
-        if (bind(control_fd, (struct sockaddr *)&control_addr, sizeof(control_addr)) != 0 || listen(control_fd, 5) != 0) {
-            log_message(f->log_fp, f->session.id, "ERROR", "Failed to bind/listen on control socket: %s", strerror(errno));
-            close(control_fd);
-            control_fd = -1;
-        }
+    char buf[8] = {0};
+    if (read(c, buf, sizeof buf - 1) < 0)
+        perror("read");
+
+    if (strcmp(buf, "kill") == 0)
+        kill(s->pid, SIGTERM);
+
+    close(c);
+}
+
+
+/* ================== utilities =========================== */
+static void list_sessions(){
+    DIR*dir=opendir(SESSION_DIR); if(!dir){perror("opendir"); return;}
+    struct dirent*e; while((e=readdir(dir))){
+        if(!strstr(e->d_name,".session")) continue;
+        char p[512]; snprintf(p,sizeof p,"%s/%s",SESSION_DIR,e->d_name);
+        FILE*f=fopen(p,"r"); if(!f) continue;
+        printf("----------------------------\n");
+        char line[256]; while(fgets(line,sizeof line,f)) printf("%s",line);
+        fclose(f);
+    }
+    closedir(dir);
+}
+
+static void kill_session(const char *sid)
+{
+    char sockp[256];
+    snprintf(sockp, sizeof sockp, "%s/%s.sock", SESSION_DIR, sid);
+
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) { perror("socket"); return; }
+
+    struct sockaddr_un a = {0};
+    a.sun_family = AF_UNIX;
+    safe_strcpy(a.sun_path, sizeof a.sun_path, sockp);
+
+    if (connect(fd, (void *)&a, sizeof a) < 0) {
+        perror("connect"); close(fd); return;
     }
 
-    int epoll_fd_parent = epoll_create1(0);
-    if(epoll_fd_parent < 0) {
-        log_message(f->log_fp, f->session.id, "ERROR", "Parent epoll_create1 failed: %s", strerror(errno));
-        close(listen_fd); if(control_fd >=0) close(control_fd); return;
+    if (write(fd, "kill", 4) < 0)
+        perror("write");
+
+    close(fd);
+}
+
+
+/* ================== argument parsing ==================== */
+static int parse_args(int argc,char**argv,Session*s,int*act,char**kid){
+    /* act: 0=run,1=list,2=help,3=kill */
+    s->timeout=300; s->check_interval=30; strcpy(s->ip_version,"v4");
+    int idx=1;
+    while(idx<argc && argv[idx][0]=='-'){
+        if(!strcmp(argv[idx],"-ls")){*act=1; return 0;}
+        else if(!strcmp(argv[idx],"-h")){*act=2; return 0;}
+        else if(!strcmp(argv[idx],"-k") && idx+1<argc){*act=3; *kid=argv[++idx]; return 0;}
+        else if(!strcmp(argv[idx],"-c") && idx+1<argc){s->check_interval=atoi(argv[++idx]);}
+        else if(!strcmp(argv[idx],"-t") && idx+1<argc){s->timeout=atoi(argv[++idx]);}
+        else break;
+        ++idx;
+    }
+    if(idx+2>=argc){
+        fprintf(stderr,"Usage: zf v4|v6 <local_addr:port> <remote_host:port> [options]\n");
+        return -1;
+    }
+    if(strcmp(argv[idx],"v4") && strcmp(argv[idx],"v6")){
+        fprintf(stderr,"First positional arg must be v4 or v6\n"); return -1;
+    }
+    strcpy(s->ip_version,argv[idx++]);
+
+    /* local */
+    char*loc=argv[idx++]; char*lp=strchr(loc,':'); if(!lp){fprintf(stderr,"bad local addr\n"); return -1;} *lp='\0';
+    safe_strcpy(s->local_addr,sizeof s->local_addr,loc); s->local_port=atoi(lp+1);
+
+    /* remote */
+    char*rem=argv[idx++]; char*rp=strrchr(rem,':'); if(!rp){fprintf(stderr,"bad remote addr\n"); return -1;} *rp='\0';
+    if(rem[0]=='['){
+        safe_strcpy(s->remote_host,sizeof s->remote_host,rem+1);
+        size_t l=strlen(s->remote_host); if(l>0&&s->remote_host[l-1]==']') s->remote_host[l-1]='\0';
+    }else safe_strcpy(s->remote_host,sizeof s->remote_host,rem);
+    s->remote_port=atoi(rp+1);
+
+    return 0;
+}
+
+/* ---------- start_forwarding (父进程保持 root，无降权) --------- */
+
+static void start_forwarding(PortForwarder *pf)
+{
+    int lfd = create_listen_socket(&pf->session);
+    if (lfd < 0) {
+        logm(pf->session.id, "ERROR", "listen failed: %s", strerror(errno));
+        return;
     }
 
-    struct epoll_event ev, events[MAX_EVENTS_PARENT];
-    ev.events = EPOLLIN;
-    ev.data.fd = listen_fd;
-    epoll_ctl(epoll_fd_parent, EPOLL_CTL_ADD, listen_fd, &ev);
-    if (control_fd >= 0) {
-        ev.data.fd = control_fd;
-        epoll_ctl(epoll_fd_parent, EPOLL_CTL_ADD, control_fd, &ev);
-    }
+    /* ---------- 控制套接字 ---------- */
+    char sockp[256];
+    snprintf(sockp, sizeof sockp, "%s/%s.sock", SESSION_DIR, pf->session.id);
+    unlink(sockp);
 
-    if (f->session.check_interval > 0) {
-        if (pthread_create(&f->check_thread, NULL, check_connection_thread, f) != 0) {
-            log_message(f->log_fp, f->session.id, "ERROR", "Failed to create health check thread. Not starting health checks.");
-            f->check_thread = 0; // Mark as not running
-        }
+    int cfd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_un u = {0};
+    u.sun_family = AF_UNIX;
+    safe_strcpy(u.sun_path, sizeof u.sun_path, sockp);   /* ← 这里替换 */
+
+    if (bind(cfd, (void *)&u, sizeof u) || listen(cfd, 5)) {
+        logm(pf->session.id, "ERROR", "control socket bind/listen: %s", strerror(errno));
+        close(lfd); close(cfd); return;
     }
-    
-    log_message(f->log_fp, f->session.id, "INFO", "Main listener started on PID %d. Waiting for events...", getpid());
+    chmod(sockp, 0600);
+
+    /* ---------- epoll & 线程 ---------- */
+    int ep = epoll_create1(EPOLL_CLOEXEC);
+    struct epoll_event ev = { .events = EPOLLIN };
+    ev.data.fd = lfd; epoll_ctl(ep, EPOLL_CTL_ADD, lfd, &ev);
+    ev.data.fd = cfd; epoll_ctl(ep, EPOLL_CTL_ADD, cfd, &ev);
+
+    if (pf->session.check_interval > 0)
+        pthread_create(&pf->check_thread, NULL, health_thread, pf);
+
+    logm(pf->session.id, "INFO",
+         "forwarder ready on %s:%d",
+         pf->session.local_addr, pf->session.local_port);
+
+    /* ---------- 事件循环 ---------- */
     while (!g_quit_flag) {
-        int nfds = epoll_wait(epoll_fd_parent, events, MAX_EVENTS_PARENT, -1); // Block indefinitely
-        if (nfds < 0) { if (errno == EINTR) continue; break; }
+        struct epoll_event e[MAX_EVENTS_PARENT];
+        int n = epoll_wait(ep, e, MAX_EVENTS_PARENT, -1);
+        if (n < 0) { if (errno == EINTR) continue; break; }
 
-        for (int i=0; i < nfds; ++i) {
-            int current_fd = events[i].data.fd;
-            if (current_fd == listen_fd) {
-                int client_fd = accept(listen_fd, NULL, NULL);
-                if (client_fd >= 0) {
-                    pid_t pid = fork();
-                    if (pid == 0) { // Child process
-                        struct sigaction sa_child = {0};
-                        sa_child.sa_handler = signal_handler_child; // Child exits on TERM/INT
-                        sigaction(SIGTERM, &sa_child, NULL);
-                        sigaction(SIGINT, &sa_child, NULL);
-                        // Child doesn't handle SIGCHLD from its own (potential) children
-                        
-                        close(listen_fd);
-                        if (control_fd >= 0) close(control_fd);
-                        close(epoll_fd_parent); // Child closes parent's epoll fd
-                        if (f->check_thread) pthread_detach(f->check_thread); // Threads are not inherited well by fork
-                        
-                        handle_tcp_connection(&f->session, client_fd, f->log_fp);
-                        
-                        fclose(f->log_fp); // Close log file copy inherited by child
-                        exit(0);
-                    }
-                     if (pid > 0) { // Parent
-                        close(client_fd); // Parent does not need the client connection socket
-                    } else { // Fork failed
-                        log_message(f->log_fp, f->session.id, "ERROR", "fork() failed: %s", strerror(errno));
-                        close(client_fd);
-                    }
-                } else {
-                     if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-                        log_message(f->log_fp, f->session.id, "WARN", "Accept failed: %s", strerror(errno));
-                     }
+        for (int i = 0; i < n; ++i) {
+            if (e[i].data.fd == lfd) {
+                int c = accept4(lfd, NULL, NULL, SOCK_CLOEXEC);
+                if (c < 0) continue;
+
+                pid_t pid = fork();
+                if (pid == 0) {                    /* ── child ── */
+                    if (geteuid() == 0) drop_privileges("nobody");
+                    signal(SIGTERM, sig_child_quit);
+                    signal(SIGINT,  sig_child_quit);
+                    close(lfd); close(cfd); close(ep);
+                    if (pf->check_thread) pthread_detach(pf->check_thread);
+                    proxy_loop(&pf->session, c);
+                    _exit(0);
                 }
-            } else if (current_fd == control_fd) {
-                handle_control_request(control_fd, f->log_fp, f->session.id, f->session.pid);
+                close(c);                          /* parent */
+            } else if (e[i].data.fd == cfd) {
+                handle_control(cfd, &pf->session);
             }
         }
     }
 
-    log_message(f->log_fp, f->session.id, "INFO", "Shutdown signal received. Cleaning up parent process.");
-    if (f->check_thread) {
-        pthread_cancel(f->check_thread); // Request cancellation
-        pthread_join(f->check_thread, NULL); // Wait for it to finish
-    }
-    close(listen_fd);
-    if (control_fd >= 0) close(control_fd);
-    close(epoll_fd_parent);
-    
-    // Attempt to terminate child processes in the same process group
-    // Note: This is a best-effort. A more robust solution might involve tracking child PIDs.
-    log_message(f->log_fp, f->session.id, "INFO", "Attempting to terminate child processes in group %d.", getpgrp());
-    kill(0, SIGTERM); 
+    logm(pf->session.id, "INFO", "shutting down");
+    if (pf->check_thread) pthread_cancel(pf->check_thread);
+    close(lfd); close(cfd); close(ep);
 }
 
-void list_sessions() {
-    DIR *dir = opendir(SESSION_DIR);
-    if (!dir) { fprintf(stderr, "Cannot open session directory %s: %s\n", SESSION_DIR, strerror(errno)); return; }
-    printf("Active Sessions:\n");
-    int count = 0;
-    struct dirent *entry;
-    while ((entry = readdir(dir))) {
-        if (strstr(entry->d_name, ".session")) {
-            char path[512];
-            snprintf(path, sizeof(path), "%s/%s", SESSION_DIR, entry->d_name);
-            FILE *fp = fopen(path, "r");
-            if (!fp) continue;
-            count++;
-            printf("----------------------------------------\n");
-            char line[256];
-            while (fgets(line, sizeof(line), fp)) printf("%s", line);
-            fclose(fp);
-            printf("Note: Live stats are not available in this version.\n");
-        }
-    }
-    if (count == 0) printf("No active sessions found.\n");
-    closedir(dir);
-}
+/* ---------- end start_forwarding ------------------------- */
 
-void kill_session(const char *session_id) {
-    char sock_path[256];
-    snprintf(sock_path, sizeof(sock_path), "%s/%s.sock", SESSION_DIR, session_id);
-    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sock < 0) { fprintf(stderr, "Failed to create control socket: %s\n", strerror(errno)); return; }
-    struct sockaddr_un addr = {0};
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
-    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "Failed to connect to session %s: %s. It may not be running or the socket file is stale.\n", session_id, strerror(errno));
-        close(sock);
-        return;
-    }
-    if (write(sock, "kill", 4) < 0) {
-        fprintf(stderr, "Failed to send kill command: %s\n", strerror(errno));
-    } else {
-        printf("Kill signal sent to session %s.\n", session_id);
-    }
-    close(sock);
-    // Deletion of session files is now handled by the main process on SIGTERM
-}
 
-int parse_args(int argc, char *argv[], Session *session, int *action_flag, char **session_id_ptr, int *verbose_flag) {
-    session->timeout = 300;
-    session->check_interval = 30;
-    strcpy(session->protocols, "tcp"); // Only TCP is supported in this version
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-ls") == 0) { *action_flag = 1; return 0; }
-        if (strcmp(argv[i], "-h") == 0) { *action_flag = 2; return 0; }
-        if (strcmp(argv[i], "--verbose") == 0) { *verbose_flag = 1; *action_flag = 2; return 0;}
-        if (strcmp(argv[i], "-k") == 0 && i + 1 < argc) { *action_flag = 3; *session_id_ptr = argv[++i]; return 0; }
-        if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) { /*strncpy(session->protocols, argv[++i], sizeof(session->protocols)-1);*/ /* No-op, only TCP */ i++; }
-        if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) session->check_interval = atoi(argv[++i]);
-        if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) session->timeout = atoi(argv[++i]);
-    }
-    if (*action_flag != 0) return 0; // If an action flag is set, no need for positional args
-    if (argc < 4) {
-        fprintf(stderr, "Error: Missing required arguments for forwarding.\n");
-        return -1;
-    }
-    strncpy(session->ip_version, argv[1], sizeof(session->ip_version)-1);
-    session->ip_version[sizeof(session->ip_version)-1] = '\0';
-    if (strcmp(session->ip_version, "v4") != 0 && strcmp(session->ip_version, "v6") != 0) {
-        fprintf(stderr, "Error: Invalid IP version '%s'. Must be 'v4' or 'v6'.\n", session->ip_version);
-        return -1;
-    }
+/* ----------------------- main (去掉父进程降权) ------------- */
+int main(int argc, char **argv)
+{
+    struct rlimit rl = { .rlim_cur = 8192, .rlim_max = 8192 };
+    setrlimit(RLIMIT_NOFILE, &rl);
 
-    char *local_arg = strdup(argv[2]);
-    if (!local_arg) { perror("strdup local_arg"); return -1;}
-    char *local_colon = strchr(local_arg, ':');
-    if (!local_colon) { fprintf(stderr, "Error: Invalid local address format '%s'. Expected addr:port.\n", argv[2]); free(local_arg); return -1; }
-    *local_colon = '\0';
-    strncpy(session->local_addr, local_arg, sizeof(session->local_addr)-1);
-    session->local_addr[sizeof(session->local_addr)-1] = '\0';
-    session->local_port = atoi(local_colon + 1);
-    free(local_arg);
+    PortForwarder pf = {0};
+    int act = 0;
+    char *kid = NULL;
 
-    char *remote_arg = strdup(argv[3]);
-    if(!remote_arg) { perror("strdup remote_arg"); return -1;}
-    char *remote_colon = strrchr(remote_arg, ':'); // Use strrchr for IPv6 addresses like [::1]:80
-    if (!remote_colon) { fprintf(stderr, "Error: Invalid remote address format '%s'. Expected host:port.\n", argv[3]); free(remote_arg); return -1; }
-    *remote_colon = '\0';
-    strncpy(session->remote_host, remote_arg, sizeof(session->remote_host)-1);
-    session->remote_host[sizeof(session->remote_host)-1] = '\0';
-    session->remote_port = atoi(remote_colon + 1);
-    free(remote_arg);
+    mkdir(SESSION_DIR, 0700);
 
-    if (session->local_port <= 0 || session->local_port > 65535) { fprintf(stderr, "Error: Invalid local port %d.\n", session->local_port); return -1; }
-    if (session->remote_port <= 0 || session->remote_port > 65535) { fprintf(stderr, "Error: Invalid remote port %d.\n", session->remote_port); return -1; }
-    return 0;
-}
-
-void save_session(const Session *session) {
-    char path[256];
-    snprintf(path, sizeof(path), "%s/%s.session", SESSION_DIR, session->id);
-    FILE *fp = fopen(path, "w");
-    if (!fp) {
-        // Cannot log here if log_fp is not yet open in main
-        fprintf(stderr, "Failed to save session file %s: %s\n", path, strerror(errno));
-        return;
-    }
-    fprintf(fp, "ID: %s\nPID: %d\nIPVersion: %s\nLocal: %s:%d\nRemote: %s:%d\nProtocol: %s\nTimeout: %d\nCheckInterval: %d\n",
-            session->id, session->pid, session->ip_version,
-            session->local_addr, session->local_port,
-            session->remote_host, session->remote_port,
-            session->protocols, session->timeout, session->check_interval);
-    fclose(fp);
-}
-
-void delete_session_files(const char* session_id, FILE *log_fp) {
-    char session_path[256], sock_path[256];
-    snprintf(session_path, sizeof(session_path), "%s/%s.session", SESSION_DIR, session_id);
-    snprintf(sock_path, sizeof(sock_path), "%s/%s.sock", SESSION_DIR, session_id);
-    if (unlink(session_path) < 0 && errno != ENOENT) {
-        log_message(log_fp, session_id, "WARN", "Failed to delete session file %s: %s", session_path, strerror(errno));
-    }
-    if (unlink(sock_path) < 0 && errno != ENOENT) {
-         log_message(log_fp, session_id, "WARN", "Failed to delete socket file %s: %s", sock_path, strerror(errno));
-    }
-}
-
-// Global log_fp for logging outside of PortForwarder struct context (e.g. early main)
-static FILE* g_main_log_fp = NULL;
-
-void log_message(FILE *log_fp_param, const char *session_id, const char *level, const char *fmt, ...) {
-    FILE *current_log_fp = log_fp_param ? log_fp_param : g_main_log_fp;
-    if (!current_log_fp) current_log_fp = stderr; // Fallback to stderr if no log file is available
-
-    time_t now = time(NULL);
-    char timestamp[32];
-    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localtime(&now));
-    
-    fprintf(current_log_fp, "%s [%s] [%s] ", timestamp, session_id ? session_id : "INIT/NO_ID", level);
-    
-    va_list args;
-    va_start(args, fmt);
-    vfprintf(current_log_fp, fmt, args);
-    va_end(args);
-    
-    fprintf(current_log_fp, "\n");
-    fflush(current_log_fp);
-}
-
-int main(int argc, char *argv[]) {
-    PortForwarder f = {0};
-    int action_flag = 0; // 0:run, 1:ls, 2:h, 3:k
-    char *session_id_ptr = NULL;
-    int verbose_flag = 0;
-
-    g_main_log_fp = stderr; // Initial log to stderr before file is opened
-
-    if (parse_args(argc, argv, &f.session, &action_flag, &session_id_ptr, &verbose_flag) < 0) {
-        fprintf(stderr, "Invalid arguments.\n"); // Use stderr as log_fp isn't open
-        print_help(0);
+    if (parse_args(argc, argv, &pf.session, &act, &kid) < 0)
         return 1;
+
+    if (act == 1) { list_sessions(); return 0; }
+    if (act == 2) {
+        puts("zf – secure port-forwarder\n"
+             "\nUSAGE:\n"
+             "  zf v4|v6 <local_addr:port> <remote_host:port> [options]\n"
+             "\nOPTIONS:\n"
+             "  -ls               List active sessions\n"
+             "  -k <session_id>   Kill a session\n"
+             "  -c <sec>          Health-check interval (default 30)\n"
+             "  -t <sec>          Idle timeout (default 300)\n"
+             "  -h                Show this help\n");
+        return 0;
+    }
+    if (act == 3) { kill_session(kid); return 0; }
+
+    /* —— daemonise —— */
+    if (!getenv("ZF_DAEMON")) {
+        pid_t p = fork(); if (p < 0) { perror("fork"); return 1; }
+        if (p > 0) { printf("daemon pid %d\n", p); return 0; }
+        setsid(); setenv("ZF_DAEMON", "1", 1);
+        p = fork(); if (p > 0) _exit(0);
+
+        if (chdir("/") < 0) perror("chdir");
+
+        int null = open("/dev/null", O_RDWR);
+        dup2(null, STDIN_FILENO);
+        dup2(null, STDOUT_FILENO);
+        dup2(null, STDERR_FILENO);
     }
 
-    if (action_flag == 1) { list_sessions(); return 0; }
-    if (action_flag == 2) { print_help(verbose_flag); return 0; }
-    if (action_flag == 3) { kill_session(session_id_ptr); return 0; }
+    /* 日志初始化 */
+    g_log = fopen(LOG_FILE, "a");
+    if (!g_log) openlog("zf", LOG_PID | LOG_CONS, LOG_DAEMON);
+    else        setvbuf(g_log, NULL, _IOLBF, 0);
 
-    if (getenv("ZF_DAEMON") == NULL) {
-        pid_t pid = fork();
-        if (pid < 0) { perror("fork"); return 1; }
-        if (pid > 0) { printf("Session daemon started with PID %d. Session ID will be: %s:%d-%ld\n", pid, f.session.local_addr, f.session.local_port, time(NULL)); return 0; }
-        
-        umask(0);
-        if (setsid() < 0) { 
-            perror("setsid"); // If setsid fails, better to exit
-            exit(1);
-        }
-        setenv("ZF_DAEMON", "1", 1);
-        
-        // It's generally good practice to fork again to ensure the process is not a session leader
-        pid = fork();
-        if (pid < 0) { perror("second fork"); exit(1); }
-        if (pid > 0) { exit(0); } // First child exits
+    pf.session.pid = getpid();
+    snprintf(pf.session.id, sizeof pf.session.id, "%s_%d-%ld",
+             pf.session.local_addr, pf.session.local_port, time(NULL));
+    sanitize_id(pf.session.id);
+    save_session(&pf.session);
 
-        chdir("/");
-        close(STDIN_FILENO); 
-        // Keep STDOUT/STDERR open until log file is confirmed, or redirect to /dev/null
-        int dev_null_fd = open("/dev/null", O_RDWR);
-        if (dev_null_fd >= 0) {
-            dup2(dev_null_fd, STDOUT_FILENO);
-            dup2(dev_null_fd, STDERR_FILENO);
-            if (dev_null_fd > STDERR_FILENO) close(dev_null_fd);
-        }
-    }
-    
-    f.log_fp = fopen(LOG_FILE, "a");
-    if (!f.log_fp) {
-        // If log file fails in daemon, there's nowhere to log this error easily
-        // except syslog, or by re-opening stderr temporarily.
-        // For simplicity here, we'll just proceed, knowing logs might be lost.
-        // A production app might try to open stderr/stdout to /dev/null if log fails.
-        f.log_fp = fopen("/dev/null", "w"); // Try to prevent crashes on log_message
-        if(!f.log_fp) exit(1); // Critical failure
-    }
-    g_main_log_fp = f.log_fp; // Switch global log to file
-    setvbuf(f.log_fp, NULL, _IOLBF, 0); // Line buffering for log file
+    struct sigaction sa = { .sa_handler = sig_parent };
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT,  &sa, NULL);
 
-    // Setup signal handlers for parent daemon
-    struct sigaction sa_term = {0}, sa_chld = {0};
-    sa_term.sa_handler = signal_handler_parent;
-    sigaction(SIGTERM, &sa_term, NULL);
-    sigaction(SIGINT, &sa_term, NULL);
+    struct sigaction sc = { .sa_handler = sig_child_exit,
+                            .sa_flags   = SA_RESTART | SA_NOCLDSTOP };
+    sigaction(SIGCHLD, &sc, NULL);
 
-    sa_chld.sa_handler = sigchld_handler;
-    sa_chld.sa_flags = SA_RESTART | SA_NOCLDSTOP;
-    sigaction(SIGCHLD, &sa_chld, NULL);
+    logm(pf.session.id, "INFO", "daemon started pid %d", pf.session.pid);
 
-    f.session.pid = getpid();
-    snprintf(f.session.id, sizeof(f.session.id), "%s:%d-%ld", f.session.local_addr, f.session.local_port, time(NULL));
-    
-    mkdir(SESSION_DIR, 0755); // Ensure session dir exists
-    save_session(&f.session);
+    start_forwarding(&pf);
 
-    log_message(f.log_fp, f.session.id, "INFO", "Daemon process initialized with PID %d.", f.session.pid);
-
-    start_forwarding(&f);
-    
-    log_message(f.log_fp, f.session.id, "INFO", "Session %s (PID: %d) shutting down.", f.session.id, f.session.pid);
-    delete_session_files(f.session.id, f.log_fp);
-    if (f.log_fp && f.log_fp != stderr && f.log_fp != fopen("/dev/null","w") /* check if it's not /dev/null */ ) {
-         fclose(f.log_fp);
-    }
-    g_main_log_fp = NULL;
-    
+    logm(pf.session.id, "INFO", "daemon exiting");
+    cleanup_files(pf.session.id);
+    if (g_log) fclose(g_log);
     return 0;
 }
+/* --------------------- end main -------------------------- */
