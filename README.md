@@ -1,69 +1,96 @@
-# zf Port Forwarding Tool
+# zf – Secure / Stable Port-Forwarding Daemon
 
 `zf` 是一个基于 Linux 系统调用的端口转发工具，支持 TCP 和 UDP 转发，IPv4 和 IPv6，具备会话管理、超时清理和链路质量监控功能。
 
-## 文件位置
 
-- **日志文件位置**:
-  - `/var/log/zf.log`
-  - 记录会话状态、连接超时、链路延迟等信息。
+> **Build**
+> ```bash
+> gcc -O2 -Wall -Wextra -pthread -o zf zf.c
+> ```
 
-- **会话文件位置**:
-  - `/var/run/zf_sessions/`
-  - 存储会话信息（`.session` 文件）和控制套接字（`.sock` 文件）。
-  - 关闭会话后，`.session` 和 `.sock` 文件会被删除。
+---
 
-- **编译位置**:
-  - 当前文件夹（执行 `install.sh` 的目录）
-  - 源文件 `zf.c` 从 https://raw.githubusercontent.com/R1tain/zf/refs/heads/main/zf.c 下载并在此编译生成可执行文件 `zf`.
+## 接口简介
 
-- **编译后文件位置**:
-  - `/usr/local/bin/zf`
-  - 编译后的可执行文件安装到此路径，可全局运行。
+```text
+zf v4|v6|all [<addr>:]port <remote_host:port> [options]
+```
 
-## 使用说明
+| 参数 (必选)          | 说明                                                                                                         |
+|----------------------|--------------------------------------------------------------------------------------------------------------|
+| `v4` / `v6` / `all`  | 监听栈类型：<br>• **v4** → 仅 IPv4 <br>• **v6** → 仅 IPv6 <br>• **all** → 双栈 (单 IPv6 socket，收 IPv4-mapped) |
+| `[<addr>:]port`      | 本地监听。仅写 `port` → IPv4 默认 `0.0.0.0`，IPv6/双栈默认 `::`.                                              |
+| `<remote_host:port>` | 远端目标。IPv6 地址可写 `[2001:db8::1]:80`.                                                                   |
 
-1. **新建会话**:
-   ```bash
-   zf v4 8080 example.com:80 -p tcp,udp -c 30 -t 30
-   ```
-   - 转发 IPv4 的 TCP 和 UDP 流量到 `example.com:80`。
-   - `-t 30`：30 秒空闲后关闭连接，主进程继续监听。
-   - `-c 30`：每 30 秒检查远程主机连通性。
-     - 若远程主机不响应，记录“连接远程主机失败”和“尝试重新连接...”，每 5 秒重试，直到恢复或会话终止。
-     - 主进程继续运行，现有连接不受影响。
+### 参数详情
 
-2. **查询会话**:
-   ```bash
-   zf -ls
-   ```
-   - 列出活动会话。
+| 选项                    | 默认 | 说明                                                   |
+|-------------------------|------|--------------------------------------------------------|
+| `-p tcp\|udp\|all`      | tcp  | 转发协议：仅 TCP、仅 UDP、或二者皆有 (`all`)           |
+| `-c <sec>`              | 30   | 远端健康检查周期（秒）                                 |
+| `-t <sec>`              | 300  | 空闲连接超时（秒，TCP 子进程）                         |
+| `-ls`                   | —    | 列出当前会话                                           |
+| `-k <session_id>`       | —    | 终止指定会话                                           |
+| `-h`                    | —    | 显示帮助                                               |
 
-3. **关闭会话**:
-   ```bash
-   zf -k <session_id>
-   ```
-   - 终止指定会话，清理 `.session` 和 `.sock` 文件。
+---
 
-4. **显示帮助**:
-   ```bash
-   zf -h
-   ```
-   - 显示详细帮助信息，包括所有参数和示例。
+## 快速示例
+
+### 1 双栈 + TCP 转发
+```bash
+zf all 8080 example.com:80
+```
+* 监听 `0.0.0.0:8080` 与 `[::]:8080`
+* 所有 TCP 流量 → `example.com:80`
+
+### 2 仅 IPv4，TCP + UDP
+```bash
+zf v4 5353 224.0.0.251:5353 -p all
+```
+
+### 3 仅 IPv6 + UDP
+```bash
+zf v6 6000 [2001:db8::1]:6000 -p udp
+```
+
+---
+
+## 管理命令
+
+```bash
+# 查看会话
+zf -ls
+
+# 终止会话
+zf -k <ID>
+```
+
+*`<ID>` 由 zf 启动时打印，格式 `stack_port-timestamp`，如 `all_8080-1748501300`.*
+
+---
+
+## 日志与会话文件
+
+| 路径                                               | 说明                                   |
+|----------------------------------------------------|----------------------------------------|
+| `/var/log/zf.log`                                  | 运行日志（logrotate：每日，保留 3 天） |
+| `/var/run/zf_sessions/<ID>.session`                | 会话元数据（文本）                     |
+| `/var/run/zf_sessions/<ID>.sock`                   | 控制套接字（用于 `-k`）                |
+
+---
+
+## 安装脚本（示例）
+
+```bash
+sudo bash install.sh     # 自动编译、安装、配置 logrotate
+```
+
+脚本会将可执行文件安装到 `/usr/local/bin/zf` 并创建日志轮转规则。
+
 
 ## 注意事项
 
-- **权限**:
-  - 安装需 root 权限（`sudo ./install.sh`）。
-  - 建议以低权限用户运行 `zf`（如 `sudo -u nobody zf ...`）。
-  - ICMP 监控需要 `CAP_NET_RAW` 权限（由 `setcap` 设置）。
-
-- **日志管理**:
-  - 日志轮转已自动配置（`/etc/logrotate.d/zf`），每周轮转，保留 4 个备份，压缩旧日志。
-  - 重复执行 `install.sh` 不会覆盖现有 `logrotate` 配置。
-
-- **IPv6**:
-  - 若使用 `-v6` 或 `-both`，确保系统和网络支持 IPv6.
 
 - **网络**:
   - 安装需要访问 https://raw.githubusercontent.com/R1tain/zf/refs/heads/main/zf.c 下载 `zf.c`。
@@ -77,12 +104,6 @@
   - 测试于 Ubuntu 22.04，确保 `gcc`、`libcap2-bin` 和 `curl` 已安装。
   - 内核版本需高于 3.7（支持 `TCP_FASTOPEN`，若不支持自动禁用）。
 
-## 编译和安装
 
-运行以下命令编译和安装：
-```bash
-chmod +x install.sh
-sudo ./install.sh
-```
 
 安装完成后，`zf` 可全局运行，日志和会话文件按上述路径存储。
