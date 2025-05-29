@@ -25,7 +25,7 @@
 
 1. **新建会话**:
    ```bash
-   zf v4 0.0.0.0:8080 example.com:80 -p tcp,udp -c 30 -t 30
+   zf v4 8080 example.com:80 -p tcp,udp -c 30 -t 30
    ```
    - 转发 IPv4 的 TCP 和 UDP 流量到 `example.com:80`。
    - `-t 30`：30 秒空闲后关闭连接，主进程继续监听。
