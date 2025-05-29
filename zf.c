@@ -391,7 +391,7 @@ static int parse_args(int argc, char **argv,
     /* 必选 3 参数: 栈 / 本地 / 远端 */
     if (idx + 2 >= argc) {
         fprintf(stderr,
-          "Usage: zf v4|v6|all [<addr>:]port <remote_host:port>"
+          "Usage: zf v4|v6|all <port | <addr:port>> <remote_host:port>"
           " [-p tcp|udp|all] [-c sec] [-t sec]\n");
         return -1;
     }
@@ -569,7 +569,7 @@ int main(int argc, char **argv)
     if (act == 2) {
         puts("zf – secure port-forwarder\n"
              "\nUSAGE:\n"
-             "  zf v4|v6|all <local_addr:port> <remote_host:port> [options]\n"
+             "  zf v4|v6|all <port | <addr:port>> <remote_host:port> [options]\n"
              "\nOPTIONS:\n"
              "  -ls               List active sessions\n"
              "  -k <session_id>   Kill a session\n"
