@@ -54,6 +54,7 @@ static inline void set_cloexec(int fd){fcntl(fd,F_SETFD,fcntl(fd,F_GETFD)|FD_CLO
 static inline void set_nonblock(int fd){fcntl(fd,F_SETFL,fcntl(fd,F_GETFL)|O_NONBLOCK);}
 static inline void sanitize_id(char*s){for(char*p=s;*p;++p)if(!((*p>='A'&&*p<='Z')||(*p>='a'&&*p<='z')||(*p>='0'&&*p<='9')||*p=='-'||*p=='_'||*p=='.'))*p='_';}
 static size_t safe_strcpy(char*d,size_t n,const char*s){size_t i=0;if(!n)return 0;while(i+1<n&&s[i]){d[i]=s[i];++i;}d[i]='\0';return i;}
+static void cleanup_files(const char *id);   /* <- add this line */
 
 /* ================== data ================================ */
 typedef struct {
@@ -66,6 +67,8 @@ typedef struct {
     int   remote_port;
     int   check_interval;   /* s */
     int   timeout;          /* s idle */
+    char  protocols[8];      /* “tcp” / “udp” / “all” */
+    bool  dual_stack;          /* true = all ；false = 单栈 */
 } Session;
 
 typedef struct {
@@ -101,25 +104,49 @@ static void drop_privileges(const char*user){
         logm(NULL,"WARN","Failed to drop privileges: %s",strerror(errno));
 }
 
-/* ================== networking helpers ================== */
-static int create_listen_socket(const Session*s){
-    int fam = strcmp(s->ip_version,"v6")?AF_INET:AF_INET6;
-    int fd = socket(fam,SOCK_STREAM|SOCK_CLOEXEC,0); if(fd<0) return -1;
-    int one=1; setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,&one,sizeof one);
-    struct sockaddr_storage a={0};
-    if(fam==AF_INET){
-        struct sockaddr_in*v=(void*)&a;
-        v->sin_family=AF_INET; v->sin_port=htons(s->local_port);
-        if(inet_pton(AF_INET,s->local_addr,&v->sin_addr)!=1) return -2;
-    }else{
-        struct sockaddr_in6*v=(void*)&a;
-        v->sin6_family=AF_INET6; v->sin6_port=htons(s->local_port);
-        if(inet_pton(AF_INET6,s->local_addr,&v->sin6_addr)!=1) return -2;
+/* ========================================================= *
+ * create_listen_socket  (支持 TCP/UDP，单栈或双栈)
+ * ========================================================= */
+static int create_listen_socket(const Session *s, bool udp_mode)
+{
+    int fam  = strcmp(s->ip_version, "v6") ? AF_INET : AF_INET6;
+    int type = udp_mode ? SOCK_DGRAM : SOCK_STREAM;
+    int fd   = socket(fam, type | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+
+    /* 双栈开关 */
+    if (fam == AF_INET6) {
+        int v6only = s->dual_stack ? 0 : 1;
+        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof v6only);
     }
-    if(bind(fd,(void*)&a,fam==AF_INET?sizeof(struct sockaddr_in):sizeof(struct sockaddr_in6))<0) return -3;
-    if(listen(fd,SOMAXCONN)<0) return -4;
-    set_nonblock(fd); return fd;
+
+    struct sockaddr_storage a = {0};
+    if (fam == AF_INET) {
+        struct sockaddr_in *v = (void *)&a;
+        v->sin_family = AF_INET;
+        v->sin_port   = htons(s->local_port);
+        if (inet_pton(AF_INET, s->local_addr, &v->sin_addr) != 1) return -2;
+    } else {
+        struct sockaddr_in6 *v = (void *)&a;
+        v->sin6_family = AF_INET6;
+        v->sin6_port   = htons(s->local_port);
+        if (inet_pton(AF_INET6, s->local_addr, &v->sin6_addr) != 1) return -2;
+    }
+
+    socklen_t len = (fam==AF_INET) ? sizeof(struct sockaddr_in)
+                                   : sizeof(struct sockaddr_in6);
+    if (bind(fd, (void*)&a, len) < 0) return -3;
+    if (!udp_mode && listen(fd, SOMAXCONN) < 0) return -4;
+
+    set_nonblock(fd);
+    return fd;
 }
+
+
+
 
 static int connect_remote(const Session*s){
     struct addrinfo h={0},*res=NULL,*rp; h.ai_socktype=SOCK_STREAM; h.ai_family=AF_UNSPEC;
@@ -134,6 +161,40 @@ static int connect_remote(const Session*s){
     }
     freeaddrinfo(res); return fd;
 }
+
+
+
+/* 单线程处理 UDP：把任一客户端的报文转发到远端，再把远端回复发回原客户端 */
+static void udp_loop(const Session *s, int lfd)
+{
+    int rfd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (rfd < 0) { perror("udp socket remote"); return; }
+
+    struct addrinfo h = {0}, *res;
+    h.ai_family = AF_UNSPEC; h.ai_socktype = SOCK_DGRAM;
+    char port[16]; snprintf(port, sizeof port, "%d", s->remote_port);
+    if (getaddrinfo(s->remote_host, port, &h, &res) != 0) { close(rfd); return; }
+
+    char buf[BUFFER_SIZE];
+    struct sockaddr_storage cli_addr = {0};
+    socklen_t cli_len = sizeof cli_addr;
+
+    while (!g_quit_flag) {
+        ssize_t n = recvfrom(lfd, buf, sizeof buf, 0,
+                             (void *)&cli_addr, &cli_len);
+        if (n < 0) { if (errno == EINTR) continue; break; }
+
+        sendto(rfd, buf, n, 0, res->ai_addr, res->ai_addrlen);
+
+        /* 等待远端答复（可加超时，这里简单阻塞一次） */
+        ssize_t m = recvfrom(rfd, buf, sizeof buf, 0, NULL, NULL);
+        if (m > 0)
+            sendto(lfd, buf, m, 0, (void *)&cli_addr, cli_len);
+    }
+    freeaddrinfo(res);
+    close(rfd);
+}
+
 
 /* ================== child proxy loop ==================== */
 static void proxy_loop(const Session *s, int cfd)
@@ -209,20 +270,38 @@ static void*health_thread(void*arg){
 }
 
 /* ================== session files ======================= */
-static void save_session(const Session*s){
-    char p[256]; snprintf(p,sizeof p,"%s/%s.session",SESSION_DIR,s->id);
-    FILE*f=fopen(p,"w"); if(!f) return;
-    fprintf(f,"ID: %s\nPID: %d\nIPVersion: %s\nLocal: %s:%d\nRemote: %s:%d\nTimeout: %d\nCheckInterval: %d\n",
-            s->id,s->pid,s->ip_version,s->local_addr,s->local_port,
-            s->remote_host,s->remote_port,s->timeout,s->check_interval);
+static void save_session(const Session *s)
+{
+    char p[256];
+    snprintf(p, sizeof p, "%s/%s.session", SESSION_DIR, s->id);
+    FILE *f = fopen(p, "w"); if (!f) return;
+
+    fprintf(f,
+        "ID: %s\nPID: %d\nStack: %s\nProtocol: %s\n"
+        "Local: %s:%d\nRemote: %s:%d\n"
+        "Timeout: %d\nCheckInterval: %d\n",
+        s->id, s->pid,
+        s->dual_stack ? "all" : s->ip_version,
+        s->protocols,
+        s->local_addr,  s->local_port,
+        s->remote_host, s->remote_port,
+        s->timeout,     s->check_interval);
+
     fclose(f);
 }
-static void cleanup_files(const char*id){
-    char p1[256],p2[256];
-    snprintf(p1,sizeof p1,"%s/%s.session",SESSION_DIR,id);
-    snprintf(p2,sizeof p2,"%s/%s.sock",SESSION_DIR,id);
-    unlink(p1); unlink(p2);
+
+/* ========================================================= *
+ * cleanup_files  —— 删除 .session / .sock 文件
+ * ========================================================= */
+static void cleanup_files(const char *id)
+{
+    char p1[256], p2[256];
+    snprintf(p1, sizeof p1, "%s/%s.session", SESSION_DIR, id);
+    snprintf(p2, sizeof p2, "%s/%s.sock",    SESSION_DIR, id);
+    unlink(p1);
+    unlink(p2);
 }
+
 
 /* ================== control socket ====================== */
 static void handle_control(int ctrl_fd, const Session *s)
@@ -278,23 +357,23 @@ static void kill_session(const char *sid)
 }
 
 
-/* ================== argument parsing ==================== */
-/* ------------------------------------------------------------- *
+/* ========================================================= *
  * parse_args
- *   - 识别动作: 0=run, 1=-ls, 2=-h, 3=-k
- *   - 支持   : zf v4|v6 [<addr>:]port <remote_host:port> [options]
- *              若省略 <addr>:   → IPv4 默认 0.0.0.0，IPv6 默认 ::
- * ------------------------------------------------------------- */
+ * ========================================================= */
+
 static int parse_args(int argc, char **argv,
                       Session *s, int *act, char **kid)
 {
+    /* 默认值 */
     s->timeout        = 300;
     s->check_interval = 30;
     strcpy(s->ip_version, "v4");
+    strcpy(s->protocols , "tcp");
+    s->dual_stack      = false;
 
     int idx = 1;
 
-    /* ----------- 预处理动作 / 可能放前面的 -c/-t ----------- */
+    /* ----- 动作选项 + 前置 -c/-t ---- */
     while (idx < argc && argv[idx][0] == '-') {
         if (!strcmp(argv[idx], "-ls")) { *act = 1; return 0; }
         if (!strcmp(argv[idx], "-h"))  { *act = 2; return 0; }
@@ -309,55 +388,77 @@ static int parse_args(int argc, char **argv,
         ++idx;
     }
 
-    /* ---------- 必选 3 参数 ---------- */
+    /* 必选 3 参数: 栈 / 本地 / 远端 */
     if (idx + 2 >= argc) {
         fprintf(stderr,
-            "Usage: zf v4|v6 [<addr>:]port <remote_host:port> [options]\n");
+          "Usage: zf v4|v6|all [<addr>:]port <remote_host:port>"
+          " [-p tcp|udp|all] [-c sec] [-t sec]\n");
         return -1;
     }
-    if (strcmp(argv[idx], "v4") && strcmp(argv[idx], "v6")) {
-        fprintf(stderr, "First arg must be v4 or v6\n"); return -1;
-    }
-    strcpy(s->ip_version, argv[idx++]);
 
-    /* local 解析 (支持仅端口) */
+    /* ① 栈类型 */
+    if (!strcmp(argv[idx], "v4")) {
+        strcpy(s->ip_version, "v4");
+    } else if (!strcmp(argv[idx], "v6")) {
+        strcpy(s->ip_version, "v6");
+    } else if (!strcmp(argv[idx], "all")) {
+        strcpy(s->ip_version, "v6");  /* 双栈用 v6 socket */
+        s->dual_stack = true;
+    } else {
+        fprintf(stderr, "First arg must be v4|v6|all\n"); return -1;
+    }
+    idx++;
+
+    /* ② 本地监听 */
     char *loc = argv[idx++];
     char *lp  = strchr(loc, ':');
-    if (lp) { *lp = '\0';
-              safe_strcpy(s->local_addr, sizeof s->local_addr, loc);
-              s->local_port = atoi(lp + 1);
-    } else { s->local_port = atoi(loc);
-             if (!s->local_port || s->local_port > 65535){
-                 fprintf(stderr,"Invalid port: %s\n",loc); return -1;}
-             strcpy(s->local_addr,
-                    strcmp(s->ip_version,"v6") ? "0.0.0.0" : "::"); }
+    if (lp) {                               /* addr:port */
+        *lp = '\0';
+        safe_strcpy(s->local_addr, sizeof s->local_addr, loc);
+        s->local_port = atoi(lp + 1);
+    } else {                                /* 仅端口 */
+        s->local_port = atoi(loc);
+        if (!s->local_port || s->local_port > 65535) {
+            fprintf(stderr, "invalid port: %s\n", loc); return -1;
+        }
+        strcpy(s->local_addr,
+               strcmp(s->ip_version,"v6") ? "0.0.0.0" : "::");
+    }
 
-    /* remote host:port */
+    /* ③ 远端 host:port */
     char *rem = argv[idx++];
     char *rp  = strrchr(rem, ':');
-    if (!rp){ fprintf(stderr,"remote must be host:port\n"); return -1; }
+    if (!rp) { fprintf(stderr,"remote must be host:port\n"); return -1; }
     *rp = '\0';
     if (rem[0]=='['){
         safe_strcpy(s->remote_host,sizeof s->remote_host,rem+1);
         size_t l=strlen(s->remote_host);
         if (l && s->remote_host[l-1]==']') s->remote_host[l-1]='\0';
-    } else safe_strcpy(s->remote_host,sizeof s->remote_host,rem);
+    } else {
+        safe_strcpy(s->remote_host,sizeof s->remote_host,rem);
+    }
     s->remote_port = atoi(rp+1);
 
-    /* ----------- 二次扫描：允许 -c/-t 在后面出现 ----------- */
+    /* ----- 二次扫描: -c/-t/-p 末尾出现 ----- */
     while (idx < argc) {
         if (!strcmp(argv[idx], "-c") && idx + 1 < argc)
             s->check_interval = atoi(argv[++idx]);
         else if (!strcmp(argv[idx], "-t") && idx + 1 < argc)
             s->timeout = atoi(argv[++idx]);
-        else {
-            fprintf(stderr, "Unknown option: %s\n", argv[idx]);
-            return -1;
+        else if (!strcmp(argv[idx], "-p") && idx + 1 < argc) {
+            safe_strcpy(s->protocols, sizeof s->protocols, argv[++idx]);
+            if (strcmp(s->protocols,"tcp") &&
+                strcmp(s->protocols,"udp") &&
+                strcmp(s->protocols,"all")) {
+                fprintf(stderr,"-p must be tcp|udp|all\n"); return -1;
+            }
+        } else {
+            fprintf(stderr,"Unknown option: %s\n", argv[idx]); return -1;
         }
         ++idx;
     }
 
-    /* 范围检查 */
+    /* 端口范围检查 */
     if (s->local_port<=0 || s->local_port>65535 ||
         s->remote_port<=0|| s->remote_port>65535){
         fprintf(stderr,"Port out of range 1-65535\n"); return -1;
@@ -365,91 +466,100 @@ static int parse_args(int argc, char **argv,
     return 0;
 }
 
-/* ---------- start_forwarding (父进程保持 root，无降权) --------- */
 
+
+
+/* ========================================================= *
+ * start_forwarding  (父进程保持 root；支持 TCP / UDP / 双栈)
+ * ========================================================= */
 static void start_forwarding(PortForwarder *pf)
 {
-    int lfd = create_listen_socket(&pf->session);
-    if (lfd < 0) {
-        logm(pf->session.id, "ERROR", "listen failed: %s", strerror(errno));
-        return;
-    }
+    bool want_udp = !strcmp(pf->session.protocols,"udp")
+                 || !strcmp(pf->session.protocols,"all");
+    bool want_tcp = !strcmp(pf->session.protocols,"tcp")
+                 || !strcmp(pf->session.protocols,"all");
 
-    /* ---------- 控制套接字 ---------- */
+    int lfd_tcp = -1, lfd_udp = -1;
+    if (want_tcp) {
+        lfd_tcp = create_listen_socket(&pf->session, false);
+        if (lfd_tcp < 0) { logm(pf->session.id,"ERROR","tcp listen failed"); want_tcp=false; }
+    }
+    if (want_udp) {
+        lfd_udp = create_listen_socket(&pf->session, true);
+        if (lfd_udp < 0) { logm(pf->session.id,"ERROR","udp bind failed");  want_udp=false; }
+    }
+    if (!want_tcp && !want_udp) return;
+
+    /* ---- 控制套接字 ---- */
     char sockp[256];
-    snprintf(sockp, sizeof sockp, "%s/%s.sock", SESSION_DIR, pf->session.id);
+    snprintf(sockp,sizeof sockp,"%s/%s.sock",SESSION_DIR,pf->session.id);
     unlink(sockp);
+    int cfd = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC,0);
+    struct sockaddr_un u={0}; u.sun_family=AF_UNIX;
+    safe_strcpy(u.sun_path,sizeof u.sun_path,sockp);
+    bind(cfd,(void*)&u,sizeof u); listen(cfd,5); chmod(sockp,0600);
 
-    int cfd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    struct sockaddr_un u = {0};
-    u.sun_family = AF_UNIX;
-    safe_strcpy(u.sun_path, sizeof u.sun_path, sockp);   /* ← 这里替换 */
-
-    if (bind(cfd, (void *)&u, sizeof u) || listen(cfd, 5)) {
-        logm(pf->session.id, "ERROR", "control socket bind/listen: %s", strerror(errno));
-        close(lfd); close(cfd); return;
-    }
-    chmod(sockp, 0600);
-
-    /* ---------- epoll & 线程 ---------- */
     int ep = epoll_create1(EPOLL_CLOEXEC);
-    struct epoll_event ev = { .events = EPOLLIN };
-    ev.data.fd = lfd; epoll_ctl(ep, EPOLL_CTL_ADD, lfd, &ev);
-    ev.data.fd = cfd; epoll_ctl(ep, EPOLL_CTL_ADD, cfd, &ev);
+    struct epoll_event ev={.events=EPOLLIN};
+    if(want_tcp){ ev.data.fd=lfd_tcp; epoll_ctl(ep,EPOLL_CTL_ADD,lfd_tcp,&ev);}
+    if(want_udp){ ev.data.fd=lfd_udp; epoll_ctl(ep,EPOLL_CTL_ADD,lfd_udp,&ev);}
+    ev.data.fd=cfd; epoll_ctl(ep,EPOLL_CTL_ADD,cfd,&ev);
 
-    if (pf->session.check_interval > 0)
-        pthread_create(&pf->check_thread, NULL, health_thread, pf);
+    if(pf->session.check_interval>0)
+        pthread_create(&pf->check_thread,NULL,health_thread,pf);
 
-    logm(pf->session.id, "INFO",
-         "forwarder ready on %s:%d",
+    logm(pf->session.id,"INFO","ready (%s,%s) %s:%d",
+         pf->session.protocols, pf->session.ip_version,
          pf->session.local_addr, pf->session.local_port);
 
-    /* ---------- 事件循环 ---------- */
-    while (!g_quit_flag) {
+    while(!g_quit_flag){
         struct epoll_event e[MAX_EVENTS_PARENT];
-        int n = epoll_wait(ep, e, MAX_EVENTS_PARENT, -1);
-        if (n < 0) { if (errno == EINTR) continue; break; }
-
-        for (int i = 0; i < n; ++i) {
-            if (e[i].data.fd == lfd) {
-                int c = accept4(lfd, NULL, NULL, SOCK_CLOEXEC);
-                if (c < 0) continue;
-
-                pid_t pid = fork();
-                if (pid == 0) {                    /* ── child ── */
-                    if (geteuid() == 0) drop_privileges("nobody");
-                    signal(SIGTERM, sig_child_quit);
-                    signal(SIGINT,  sig_child_quit);
-                    close(lfd); close(cfd); close(ep);
-                    if (pf->check_thread) pthread_detach(pf->check_thread);
-                    proxy_loop(&pf->session, c);
-                    _exit(0);
+        int n=epoll_wait(ep,e,MAX_EVENTS_PARENT,-1);
+        if(n<0){if(errno==EINTR)continue;break;}
+        for(int i=0;i<n;++i){
+            int fd=e[i].data.fd;
+            if(fd==lfd_tcp){
+                int c=accept4(lfd_tcp,NULL,NULL,SOCK_CLOEXEC);
+                if(c<0)continue;
+                pid_t pid=fork();
+                if(pid==0){
+                    if(geteuid()==0) drop_privileges("nobody");
+                    signal(SIGTERM,sig_child_quit); signal(SIGINT,sig_child_quit);
+                    close(lfd_tcp); if(want_udp)close(lfd_udp);
+                    close(cfd); close(ep);
+                    if(pf->check_thread) pthread_detach(pf->check_thread);
+                    proxy_loop(&pf->session,c); _exit(0);
                 }
-                close(c);                          /* parent */
-            } else if (e[i].data.fd == cfd) {
-                handle_control(cfd, &pf->session);
+                close(c);
+            } else if(fd==lfd_udp){
+                /* 单线程 UDP 转发（复用 rfd） */
+                udp_loop(&pf->session, lfd_udp);
+                epoll_ctl(ep,EPOLL_CTL_DEL,lfd_udp,NULL);
+            } else if(fd==cfd){
+                handle_control(cfd,&pf->session);
             }
         }
     }
 
-    logm(pf->session.id, "INFO", "shutting down");
-    if (pf->check_thread) pthread_cancel(pf->check_thread);
-    close(lfd); close(cfd); close(ep);
+    logm(pf->session.id,"INFO","shutting down");
+    if(pf->check_thread) pthread_cancel(pf->check_thread);
+    if(want_tcp) close(lfd_tcp);
+    if(want_udp) close(lfd_udp);
+    close(cfd); close(ep);
 }
 
 /* ---------- end start_forwarding ------------------------- */
 
 
 /* ----------------------- main (去掉父进程降权) ------------- */
+
 int main(int argc, char **argv)
 {
     struct rlimit rl = { .rlim_cur = 8192, .rlim_max = 8192 };
     setrlimit(RLIMIT_NOFILE, &rl);
 
     PortForwarder pf = {0};
-    int act = 0;
-    char *kid = NULL;
-
+    int act = 0; char *kid = NULL;
     mkdir(SESSION_DIR, 0700);
 
     if (parse_args(argc, argv, &pf.session, &act, &kid) < 0)
@@ -459,12 +569,13 @@ int main(int argc, char **argv)
     if (act == 2) {
         puts("zf – secure port-forwarder\n"
              "\nUSAGE:\n"
-             "  zf v4|v6 <local_addr:port> <remote_host:port> [options]\n"
+             "  zf v4|v6|all <local_addr:port> <remote_host:port> [options]\n"
              "\nOPTIONS:\n"
              "  -ls               List active sessions\n"
              "  -k <session_id>   Kill a session\n"
              "  -c <sec>          Health-check interval (default 30)\n"
              "  -t <sec>          Idle timeout (default 300)\n"
+             "  -p tcp|udp|all    Protocol(s) to forward (default tcp)\n"
              "  -h                Show this help\n");
         return 0;
     }
@@ -474,43 +585,38 @@ int main(int argc, char **argv)
     if (!getenv("ZF_DAEMON")) {
         pid_t p = fork(); if (p < 0) { perror("fork"); return 1; }
         if (p > 0) { printf("daemon pid %d\n", p); return 0; }
-        setsid(); setenv("ZF_DAEMON", "1", 1);
+        setsid(); setenv("ZF_DAEMON","1",1);
         p = fork(); if (p > 0) _exit(0);
-
         if (chdir("/") < 0) perror("chdir");
-
         int null = open("/dev/null", O_RDWR);
-        dup2(null, STDIN_FILENO);
-        dup2(null, STDOUT_FILENO);
-        dup2(null, STDERR_FILENO);
+        dup2(null, STDIN_FILENO); dup2(null, STDOUT_FILENO); dup2(null, STDERR_FILENO);
     }
 
-    /* 日志初始化 */
+    /* 日志 */
     g_log = fopen(LOG_FILE, "a");
     if (!g_log) openlog("zf", LOG_PID | LOG_CONS, LOG_DAEMON);
     else        setvbuf(g_log, NULL, _IOLBF, 0);
 
     pf.session.pid = getpid();
     snprintf(pf.session.id, sizeof pf.session.id, "%s_%d-%ld",
-             pf.session.local_addr, pf.session.local_port, time(NULL));
+             pf.session.dual_stack ? "all" : pf.session.ip_version,
+             pf.session.local_port, time(NULL));
     sanitize_id(pf.session.id);
     save_session(&pf.session);
 
     struct sigaction sa = { .sa_handler = sig_parent };
-    sigaction(SIGTERM, &sa, NULL);
-    sigaction(SIGINT,  &sa, NULL);
-
+    sigaction(SIGTERM, &sa, NULL); sigaction(SIGINT, &sa, NULL);
     struct sigaction sc = { .sa_handler = sig_child_exit,
                             .sa_flags   = SA_RESTART | SA_NOCLDSTOP };
     sigaction(SIGCHLD, &sc, NULL);
 
     logm(pf.session.id, "INFO", "daemon started pid %d", pf.session.pid);
-
     start_forwarding(&pf);
-
     logm(pf.session.id, "INFO", "daemon exiting");
     cleanup_files(pf.session.id);
     if (g_log) fclose(g_log);
     return 0;
 }
+
+
 /* --------------------- end main -------------------------- */
