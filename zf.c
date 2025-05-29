@@ -279,40 +279,89 @@ static void kill_session(const char *sid)
 
 
 /* ================== argument parsing ==================== */
-static int parse_args(int argc,char**argv,Session*s,int*act,char**kid){
-    /* act: 0=run,1=list,2=help,3=kill */
-    s->timeout=300; s->check_interval=30; strcpy(s->ip_version,"v4");
-    int idx=1;
-    while(idx<argc && argv[idx][0]=='-'){
-        if(!strcmp(argv[idx],"-ls")){*act=1; return 0;}
-        else if(!strcmp(argv[idx],"-h")){*act=2; return 0;}
-        else if(!strcmp(argv[idx],"-k") && idx+1<argc){*act=3; *kid=argv[++idx]; return 0;}
-        else if(!strcmp(argv[idx],"-c") && idx+1<argc){s->check_interval=atoi(argv[++idx]);}
-        else if(!strcmp(argv[idx],"-t") && idx+1<argc){s->timeout=atoi(argv[++idx]);}
+/* ------------------------------------------------------------- *
+ * parse_args
+ *   - 识别动作: 0=run, 1=-ls, 2=-h, 3=-k
+ *   - 支持   : zf v4|v6 [<addr>:]port <remote_host:port> [options]
+ *              若省略 <addr>:   → IPv4 默认 0.0.0.0，IPv6 默认 ::
+ * ------------------------------------------------------------- */
+static int parse_args(int argc, char **argv,
+                      Session *s, int *act, char **kid)
+{
+    s->timeout        = 300;
+    s->check_interval = 30;
+    strcpy(s->ip_version, "v4");
+
+    int idx = 1;
+
+    /* ----------- 预处理动作 / 可能放前面的 -c/-t ----------- */
+    while (idx < argc && argv[idx][0] == '-') {
+        if (!strcmp(argv[idx], "-ls")) { *act = 1; return 0; }
+        if (!strcmp(argv[idx], "-h"))  { *act = 2; return 0; }
+        if (!strcmp(argv[idx], "-k") && idx + 1 < argc) {
+            *act = 3; *kid = argv[++idx]; return 0;
+        }
+        if (!strcmp(argv[idx], "-c") && idx + 1 < argc)
+            s->check_interval = atoi(argv[++idx]);
+        else if (!strcmp(argv[idx], "-t") && idx + 1 < argc)
+            s->timeout = atoi(argv[++idx]);
         else break;
         ++idx;
     }
-    if(idx+2>=argc){
-        fprintf(stderr,"Usage: zf v4|v6 <local_addr:port> <remote_host:port> [options]\n");
+
+    /* ---------- 必选 3 参数 ---------- */
+    if (idx + 2 >= argc) {
+        fprintf(stderr,
+            "Usage: zf v4|v6 [<addr>:]port <remote_host:port> [options]\n");
         return -1;
     }
-    if(strcmp(argv[idx],"v4") && strcmp(argv[idx],"v6")){
-        fprintf(stderr,"First positional arg must be v4 or v6\n"); return -1;
+    if (strcmp(argv[idx], "v4") && strcmp(argv[idx], "v6")) {
+        fprintf(stderr, "First arg must be v4 or v6\n"); return -1;
     }
-    strcpy(s->ip_version,argv[idx++]);
+    strcpy(s->ip_version, argv[idx++]);
 
-    /* local */
-    char*loc=argv[idx++]; char*lp=strchr(loc,':'); if(!lp){fprintf(stderr,"bad local addr\n"); return -1;} *lp='\0';
-    safe_strcpy(s->local_addr,sizeof s->local_addr,loc); s->local_port=atoi(lp+1);
+    /* local 解析 (支持仅端口) */
+    char *loc = argv[idx++];
+    char *lp  = strchr(loc, ':');
+    if (lp) { *lp = '\0';
+              safe_strcpy(s->local_addr, sizeof s->local_addr, loc);
+              s->local_port = atoi(lp + 1);
+    } else { s->local_port = atoi(loc);
+             if (!s->local_port || s->local_port > 65535){
+                 fprintf(stderr,"Invalid port: %s\n",loc); return -1;}
+             strcpy(s->local_addr,
+                    strcmp(s->ip_version,"v6") ? "0.0.0.0" : "::"); }
 
-    /* remote */
-    char*rem=argv[idx++]; char*rp=strrchr(rem,':'); if(!rp){fprintf(stderr,"bad remote addr\n"); return -1;} *rp='\0';
-    if(rem[0]=='['){
+    /* remote host:port */
+    char *rem = argv[idx++];
+    char *rp  = strrchr(rem, ':');
+    if (!rp){ fprintf(stderr,"remote must be host:port\n"); return -1; }
+    *rp = '\0';
+    if (rem[0]=='['){
         safe_strcpy(s->remote_host,sizeof s->remote_host,rem+1);
-        size_t l=strlen(s->remote_host); if(l>0&&s->remote_host[l-1]==']') s->remote_host[l-1]='\0';
-    }else safe_strcpy(s->remote_host,sizeof s->remote_host,rem);
-    s->remote_port=atoi(rp+1);
+        size_t l=strlen(s->remote_host);
+        if (l && s->remote_host[l-1]==']') s->remote_host[l-1]='\0';
+    } else safe_strcpy(s->remote_host,sizeof s->remote_host,rem);
+    s->remote_port = atoi(rp+1);
 
+    /* ----------- 二次扫描：允许 -c/-t 在后面出现 ----------- */
+    while (idx < argc) {
+        if (!strcmp(argv[idx], "-c") && idx + 1 < argc)
+            s->check_interval = atoi(argv[++idx]);
+        else if (!strcmp(argv[idx], "-t") && idx + 1 < argc)
+            s->timeout = atoi(argv[++idx]);
+        else {
+            fprintf(stderr, "Unknown option: %s\n", argv[idx]);
+            return -1;
+        }
+        ++idx;
+    }
+
+    /* 范围检查 */
+    if (s->local_port<=0 || s->local_port>65535 ||
+        s->remote_port<=0|| s->remote_port>65535){
+        fprintf(stderr,"Port out of range 1-65535\n"); return -1;
+    }
     return 0;
 }
 
